@@ -360,7 +360,6 @@ const saveText = ref("等待保存");
 const isLoadingWorkspace = ref(true);
 const dataDirectory = ref("");
 const activeTab = ref<AppTab>("reimbursement");
-const draggingId = ref<string | null>(null);
 const historySearch = ref("");
 const historyDate = ref("");
 const historyStatus = ref<ReimbursementStatus | "">("");
@@ -389,7 +388,10 @@ const pointerState = ref<{
   width: number;
   height: number;
 } | null>(null);
-const expenseDragState = ref<{ id: string } | null>(null);
+const expenseDragState = ref<{
+  id: string;
+  surface: "list" | "paper";
+} | null>(null);
 
 const selectedExpense = computed(
   () => draft.expenses.find((item) => item.id === selectedId.value) ?? null,
@@ -912,11 +914,7 @@ function readImage(file: File) {
     },
   );
 }
-async function addFile(
-  file: File,
-  notify = true,
-  targetRecordId = draft.id,
-) {
+async function addFile(file: File, notify = true, targetRecordId = draft.id) {
   if (draft.id !== targetRecordId) return false;
   if (!file.type.startsWith("image/")) {
     if (notify) ElMessage.warning("请选择图片文件");
@@ -935,8 +933,7 @@ async function addFile(
     );
     if (draft.id !== targetRecordId) return false;
     if (draft.expenses.length >= MAX_EXPENSES) {
-      if (notify)
-        ElMessage.warning(`一张报销单最多上传${MAX_EXPENSES}张图片`);
+      if (notify) ElMessage.warning(`一张报销单最多上传${MAX_EXPENSES}张图片`);
       return false;
     }
     const expense: Expense = {
@@ -1182,70 +1179,64 @@ async function removeExpense(expense: Expense) {
     /* 用户取消 */
   }
 }
-function reorderExpense(sourceId: string, targetId: string) {
-  if (sourceId === targetId) return;
+function reorderExpense(sourceId: string, targetIndex: number) {
   const sourceIndex = draft.expenses.findIndex((item) => item.id === sourceId);
-  const targetIndex = draft.expenses.findIndex((item) => item.id === targetId);
-  if (sourceIndex < 0 || targetIndex < 0) return;
+  const nextIndex = Math.max(
+    0,
+    Math.min(targetIndex, draft.expenses.length - 1),
+  );
+  if (sourceIndex < 0 || sourceIndex === nextIndex) return;
   const [source] = draft.expenses.splice(sourceIndex, 1);
-  draft.expenses.splice(targetIndex, 0, source);
+  draft.expenses.splice(nextIndex, 0, source);
   reflowExpenses();
   dirty();
 }
-function dragStart(event: DragEvent, expense: Expense) {
-  draggingId.value = expense.id;
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", expense.id);
-  }
-}
 function expenseDragStart(event: PointerEvent) {
   if (event.button !== 0 || !(event.target instanceof Element)) return;
-  const handle = event.target.closest(".drag-handle");
-  const card = handle?.closest<HTMLElement>(".expense-card");
-  const expenseId = card?.dataset.expenseId;
-  if (!handle || !card || !expenseId) return;
+  const listHandle = event.target.closest<HTMLElement>(".drag-handle");
+  const paperHandle = event.target.closest<HTMLElement>(
+    ".paper-row-drag-handle",
+  );
+  const surface = paperHandle ? "paper" : listHandle ? "list" : null;
+  const handle = paperHandle ?? listHandle;
+  const item =
+    surface === "paper"
+      ? handle?.closest<HTMLElement>("tr[data-expense-id]")
+      : handle?.closest<HTMLElement>(".expense-card[data-expense-id]");
+  const expenseId = item?.dataset.expenseId;
+  if (!surface || !handle || !item || !expenseId) return;
   event.preventDefault();
-  expenseDragState.value = { id: expenseId };
-  draggingId.value = expenseId;
-  card.classList.add("dragging");
+  expenseDragState.value = { id: expenseId, surface };
+  handle.setPointerCapture?.(event.pointerId);
 }
 function expenseDragMove(event: PointerEvent) {
   const state = expenseDragState.value;
   if (!state) return;
   event.preventDefault();
-  const list = document.querySelector<HTMLElement>(".expense-list");
-  const cards = Array.from(
-    document.querySelectorAll<HTMLElement>(".expense-card"),
-  );
-  if (!list || !cards.length) return;
-  const listRect = list.getBoundingClientRect();
-  if (event.clientY < listRect.top + 28) list.scrollTop -= 14;
-  else if (event.clientY > listRect.bottom - 28) list.scrollTop += 14;
-  const target =
-    cards.find(
-      (card) =>
-        event.clientY <
-        card.getBoundingClientRect().top +
-          card.getBoundingClientRect().height / 2,
-    ) ?? cards[cards.length - 1];
-  const targetId = target.dataset.expenseId;
-  if (targetId) reorderExpense(state.id, targetId);
+  const selector =
+    state.surface === "paper"
+      ? ".paper-table tbody tr[data-expense-id]"
+      : ".expense-card[data-expense-id]";
+  const items = Array.from(
+    document.querySelectorAll<HTMLElement>(selector),
+  ).filter((item) => item.dataset.expenseId !== state.id);
+  if (!items.length) return;
+  if (state.surface === "list") {
+    const list = document.querySelector<HTMLElement>(".expense-list");
+    if (list) {
+      const listRect = list.getBoundingClientRect();
+      if (event.clientY < listRect.top + 28) list.scrollTop -= 14;
+      else if (event.clientY > listRect.bottom - 28) list.scrollTop += 14;
+    }
+  }
+  const targetIndex = items.findIndex((item) => {
+    const rect = item.getBoundingClientRect();
+    return event.clientY < rect.top + rect.height / 2;
+  });
+  reorderExpense(state.id, targetIndex < 0 ? items.length : targetIndex);
 }
 function expenseDragStop() {
-  document
-    .querySelector(".expense-card.dragging")
-    ?.classList.remove("dragging");
   expenseDragState.value = null;
-  draggingId.value = null;
-}
-function dragEnd() {
-  expenseDragStop();
-}
-function dropOn(expense: Expense) {
-  const sourceId = draggingId.value;
-  expenseDragStop();
-  if (sourceId) reorderExpense(sourceId, expense.id);
 }
 function updateScale() {
   const viewport = previewViewport.value;
@@ -2841,19 +2832,16 @@ onUnmounted(() => {
               :key="expense.id"
               :data-expense-id="expense.id"
               class="expense-card"
-              :class="{ active: expense.id === selectedId }"
+              :class="{
+                active: expense.id === selectedId,
+                dragging:
+                  expenseDragState?.surface === 'list' &&
+                  expenseDragState.id === expense.id,
+              }"
               @click="selectExpense(expense)"
-              @dragover.prevent
-              @drop="dropOn(expense)"
-              @dragend="dragEnd"
             >
               <div class="expense-card-topline">
-                <span
-                  class="drag-handle"
-                  draggable="true"
-                  title="拖动调整顺序"
-                  @click.stop
-                  @dragstart="dragStart($event, expense)"
+                <span class="drag-handle" title="拖动调整顺序" @click.stop
                   ><Sort :size="15" /></span
                 ><span class="expense-index">{{ index + 1 }}</span
                 ><el-image
@@ -2990,7 +2978,7 @@ onUnmounted(() => {
                 <el-input
                   v-model="draft.label"
                   clearable
-                  maxlength="20"
+                  maxlength="80"
                   placeholder="便于查询"
                   @input="dirty"
                 />
@@ -3135,20 +3123,21 @@ onUnmounted(() => {
                         ><tr
                           v-for="(expense, index) in draft.expenses"
                           :key="expense.id"
-                          :class="{ 'selected-row': expense.id === selectedId }"
+                          :data-expense-id="expense.id"
+                          :class="{
+                            'selected-row': expense.id === selectedId,
+                            'dragging-row':
+                              expenseDragState?.surface === 'paper' &&
+                              expenseDragState.id === expense.id,
+                          }"
                           @click="selectExpense(expense)"
-                          @dragover.prevent
-                          @drop.stop="dropOn(expense)"
-                          @dragend="dragEnd"
                         >
                           <td>
                             <span class="paper-row-index">
                               <span
                                 class="paper-row-drag-handle"
-                                draggable="true"
                                 title="拖动调整费用顺序"
                                 @click.stop
-                                @dragstart="dragStart($event, expense)"
                                 ><Sort :size="12"
                               /></span>
                               <span>{{ index + 1 }}</span>
@@ -4180,7 +4169,7 @@ onUnmounted(() => {
         <h1>SheepFinance</h1>
         <p>将票据截图识别、核对并排版为报销单的本地桌面工具。</p>
         <div class="about-meta">
-          <span>版本 0.1.5</span><span>Windows 10 x64</span>
+          <span>版本 0.1.6</span><span>Windows 10 x64</span>
         </div>
         <div class="about-links">
           <el-link
@@ -4723,6 +4712,9 @@ h3 {
 .paper-table tr.selected-row td {
   background: #fff7f3;
 }
+.paper-table tr.dragging-row td {
+  background: #f6e9e4;
+}
 .paper-table .empty-row td {
   color: #a7afa9;
 }
@@ -4740,6 +4732,7 @@ h3 {
   justify-content: center;
   color: #9aa5a0;
   cursor: grab;
+  touch-action: none;
   user-select: none;
 }
 .paper-row-drag-handle:active {
@@ -6141,8 +6134,17 @@ h3 {
 }
 .preview-toolbar {
   padding: 0 18px;
+  flex-wrap: wrap;
+  height: auto;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+.reimbursement-active .preview-toolbar {
+  flex: 0 0 auto;
 }
 .preview-toolbar-right {
+  flex: 1 1 690px;
+  flex-wrap: wrap;
   gap: 8px;
 }
 .preview-context-selects {
@@ -6163,10 +6165,10 @@ h3 {
   width: 122px;
 }
 .preview-context-selects .el-input {
-  width: 104px;
+  width: 320px;
 }
 .preview-context-selects .preview-label-input {
-  grid-template-columns: auto 104px;
+  grid-template-columns: auto 320px;
 }
 .preview-zoom-tools {
   width: 100px;

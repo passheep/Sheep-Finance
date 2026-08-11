@@ -12,16 +12,18 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
 const ALIYUN_API_VERSION: &str = "2021-07-07";
+const ADVANCED_OCR_QUERY: &str = "NeedRotate=true&NeedSortPage=true&Paragraph=true&Row=true";
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const EXTRACTION_SYSTEM_PROMPT: &str = concat!(
     "你是严格的中文报销单据字段提取器。只根据 OCR 原文提取，不得编造。",
-    "无论信息是否完整，都必须返回且只能返回一个合法 JSON 对象，禁止 Markdown、解释、前后缀和空响应。",
+    "不要输出分析、思考过程或 reasoning_content。无论信息是否完整，都必须返回且只能返回一个合法 JSON 对象，禁止 Markdown、解释、前后缀和空响应。",
     "JSON 必须包含 occurredDate、reasonName、description、amount、confidence、evidence 六个键；",
     "无法确定的标量填 null，confidence 和 evidence 无内容时填空对象。",
     "occurredDate 使用 YYYY-MM-DD，优先取支付时间或交易时间；",
     "reasonName 必须严格选自给定事由字典，不能确定时填 null；",
     "description 用简短中文概括商品、服务或商户；",
     "amount 是本笔可报销的实际支付金额，返回正数两位小数字符串，支付截图中的支出负号要去掉；",
+    "金额中的英文逗号或中文全角逗号可能是千分位，例如 1,546.69 或 1，546.69 都表示 1546.69，不能截断；",
     "优先取实付、支付金额、付款金额或合计，不要把优惠金额、商品原价、余额或授信额度当作实付。"
 );
 
@@ -71,6 +73,13 @@ impl OcrMode {
         match self {
             Self::Advanced => "RecognizeAdvanced",
             Self::Handwriting => "RecognizeHandwriting",
+        }
+    }
+
+    fn query(self) -> &'static str {
+        match self {
+            Self::Advanced => ADVANCED_OCR_QUERY,
+            Self::Handwriting => "",
         }
     }
 }
@@ -172,7 +181,11 @@ async fn call_aliyun_ocr(
     mode: OcrMode,
     image: Vec<u8>,
 ) -> Result<String, String> {
-    let endpoint = normalized_endpoint(&profile.endpoint, "阿里云 OCR")?;
+    let mut endpoint = normalized_endpoint(&profile.endpoint, "阿里云 OCR")?;
+    let canonical_query = mode.query();
+    if !canonical_query.is_empty() {
+        endpoint.set_query(Some(canonical_query));
+    }
     let host = endpoint
         .host_str()
         .ok_or_else(|| "阿里云 OCR 服务地址缺少主机名".to_string())?;
@@ -201,8 +214,9 @@ async fn call_aliyun_ocr(
             "host;x-acs-action;x-acs-content-sha256;x-acs-date;x-acs-region-id;x-acs-signature-nonce;x-acs-version".to_string(),
         )
     };
-    let canonical_request =
-        format!("POST\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let canonical_request = format!(
+        "POST\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
     let string_to_sign = format!(
         "ACS3-HMAC-SHA256\n{}",
         sha256_hex(canonical_request.as_bytes())
@@ -268,15 +282,7 @@ async fn call_llm(
     let user_prompt = format!(
         "事由字典：{reason_json}\n\nOCR 原文：\n{ocr_text}\n\n严格按此结构返回 JSON：{{\"occurredDate\":null,\"reasonName\":null,\"description\":null,\"amount\":null,\"confidence\":{{}},\"evidence\":{{}}}}"
     );
-    let request_body = json!({
-        "model": profile.model.trim(),
-        "messages": [
-            { "role": "system", "content": EXTRACTION_SYSTEM_PROMPT },
-            { "role": "user", "content": user_prompt }
-        ],
-        "temperature": 0,
-        "max_tokens": 700
-    });
+    let request_body = llm_request_body(profile, &endpoint, &user_prompt);
     let timeout = Duration::from_secs(profile.timeout_seconds.clamp(5, 180));
     let client = Client::builder()
         .timeout(timeout)
@@ -285,50 +291,58 @@ async fn call_llm(
     let first_response = send_llm_request(&client, &endpoint, profile, &request_body)
         .await
         .map_err(|message| (message, None))?;
-    let first_record = llm_response_record(&first_response);
-    let first_error = match extract_llm_content(&first_response) {
-        Some(content) => match parse_extracted_expense(&content, reasons) {
-            Ok(extracted) => return Ok((extracted, content)),
+    let first_content = extract_llm_content(&first_response);
+    let first_error = match first_content.as_deref() {
+        Some(content) => match parse_extracted_expense(content, reasons) {
+            Ok(extracted) => return Ok((extracted, normalized_json_record(content))),
             Err(message) => message,
         },
         None => "大模型响应中没有可用文本内容".to_string(),
     };
+    let first_record = first_content.as_deref().unwrap_or("未返回 content");
 
     let retry_prompt = format!(
         "上一次响应未通过 JSON 校验：{first_error}\n\n事由字典：{reason_json}\n\nOCR 原文：\n{ocr_text}\n\n上一次响应记录：\n{first_record}\n\n重新提取并只返回一个合法 JSON 对象。必须包含 occurredDate、reasonName、description、amount、confidence、evidence。"
     );
-    let retry_body = json!({
-        "model": profile.model.trim(),
-        "messages": [
-            { "role": "system", "content": EXTRACTION_SYSTEM_PROMPT },
-            { "role": "user", "content": retry_prompt }
-        ],
-        "temperature": 0,
-        "max_tokens": 700
-    });
+    let retry_body = llm_request_body(profile, &endpoint, &retry_prompt);
     let retry_response = send_llm_request(&client, &endpoint, profile, &retry_body)
         .await
         .map_err(|message| {
             (
                 format!("{first_error}；严格 JSON 重试失败：{message}"),
-                Some(format!("首次响应：\n{first_record}")),
+                None,
             )
         })?;
-    let retry_record = llm_response_record(&retry_response);
-    let combined_record = format!("首次响应：\n{first_record}\n\n严格重试响应：\n{retry_record}");
-    let retry_content = extract_llm_content(&retry_response).ok_or_else(|| {
-        (
-            "大模型严格重试后仍未返回可用文本内容".to_string(),
-            Some(combined_record.clone()),
-        )
-    })?;
+    let retry_content = extract_llm_content(&retry_response)
+        .ok_or_else(|| ("大模型严格重试后仍未返回可用文本内容".to_string(), None))?;
     let extracted = parse_extracted_expense(&retry_content, reasons).map_err(|message| {
         (
             format!("大模型严格重试后仍未返回合法 JSON：{message}"),
-            Some(combined_record.clone()),
+            None,
         )
     })?;
-    Ok((extracted, combined_record))
+    Ok((extracted, normalized_json_record(&retry_content)))
+}
+
+fn llm_request_body(profile: &LlmProfile, endpoint: &Url, user_prompt: &str) -> Value {
+    let mut body = json!({
+        "model": profile.model.trim(),
+        "messages": [
+            { "role": "system", "content": EXTRACTION_SYSTEM_PROMPT },
+            { "role": "user", "content": user_prompt }
+        ],
+        "response_format": { "type": "json_object" },
+        "temperature": 0,
+        "max_tokens": 700,
+        "stream": false
+    });
+    if endpoint
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.deepseek.com"))
+    {
+        body["thinking"] = json!({ "type": "disabled" });
+    }
+    body
 }
 
 async fn send_llm_request(
@@ -362,7 +376,6 @@ fn extract_llm_content(response: &Value) -> Option<String> {
         response.pointer("/choices/0/message/content"),
         response.pointer("/choices/0/text"),
         response.get("output_text"),
-        response.pointer("/choices/0/message/reasoning_content"),
     ]
     .into_iter()
     .flatten()
@@ -388,10 +401,11 @@ fn content_value_text(value: &Value) -> Option<String> {
     }
 }
 
-fn llm_response_record(response: &Value) -> String {
-    extract_llm_content(response).unwrap_or_else(|| {
-        serde_json::to_string_pretty(response).unwrap_or_else(|_| response.to_string())
-    })
+fn normalized_json_record(content: &str) -> String {
+    first_json_object(content)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| content.trim().to_string())
 }
 
 fn normalized_endpoint(value: &str, service: &str) -> Result<Url, String> {
@@ -428,26 +442,38 @@ fn extract_ocr_text(response: &Value) -> Option<String> {
         }),
         other => other.clone(),
     };
-    parsed
-        .get("content")
-        .or_else(|| parsed.get("Content"))
-        .and_then(Value::as_str)
+    join_ocr_items(&parsed, &["prism_rowsInfo", "rowsInfo", "RowsInfo"])
+        .or_else(|| {
+            join_ocr_items(
+                &parsed,
+                &["prism_paragraphsInfo", "paragraphsInfo", "ParagraphsInfo"],
+            )
+        })
+        .or_else(|| {
+            parsed
+                .get("content")
+                .or_else(|| parsed.get("Content"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| join_ocr_items(&parsed, &["prism_wordsInfo", "wordsInfo", "WordsInfo"]))
+}
+
+fn join_ocr_items(value: &Value, keys: &[&str]) -> Option<String> {
+    let items = keys
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_array))?;
+    let text = items
+        .iter()
+        .filter_map(|item| item.get("word").or_else(|| item.get("text")))
+        .filter_map(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let words = parsed
-                .get("prism_wordsInfo")
-                .or_else(|| parsed.get("wordsInfo"))?
-                .as_array()?;
-            let text = words
-                .iter()
-                .filter_map(|item| item.get("word").or_else(|| item.get("text")))
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.trim().is_empty()).then_some(text)
-        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn parse_extracted_expense(content: &str, reasons: &[String]) -> Result<ExtractedExpense, String> {
@@ -560,7 +586,7 @@ fn days_in_month(year: i32, month: u8) -> u8 {
 }
 
 fn decimal_to_cents(value: &str) -> Option<i64> {
-    let normalized = value.trim().replace([',', '￥', '¥', '元', ' '], "");
+    let normalized = value.trim().replace([',', '，', '￥', '¥', '元', ' '], "");
     if normalized.is_empty() || normalized.starts_with('-') {
         return None;
     }
@@ -634,6 +660,35 @@ mod tests {
     }
 
     #[test]
+    fn prefers_aliyun_rows_and_falls_back_to_paragraphs() {
+        let rows = json!({
+            "Data": serde_json::to_string(&json!({
+                "content": "无格式全文",
+                "prism_paragraphsInfo": [{ "word": "段落内容" }],
+                "prism_rowsInfo": [{ "word": "第一行" }, { "word": "第二行" }]
+            })).expect("ocr data")
+        });
+        assert_eq!(extract_ocr_text(&rows).as_deref(), Some("第一行\n第二行"));
+
+        let paragraphs = json!({
+            "Data": {
+                "content": "无格式全文",
+                "prism_paragraphsInfo": [{ "word": "第一段" }, { "word": "第二段" }]
+            }
+        });
+        assert_eq!(
+            extract_ocr_text(&paragraphs).as_deref(),
+            Some("第一段\n第二段")
+        );
+    }
+
+    #[test]
+    fn advanced_ocr_enables_layout_parameters_only() {
+        assert_eq!(OcrMode::Advanced.query(), ADVANCED_OCR_QUERY);
+        assert_eq!(OcrMode::Handwriting.query(), "");
+    }
+
+    #[test]
     fn validates_and_normalizes_model_result() {
         let result = parse_extracted_expense(
             "```json\n{\"occurredDate\":\"2026-08-07\",\"reasonName\":\"办公费\",\"description\":\"购买纸张\",\"amount\":\"1,028.50\"}\n```",
@@ -643,6 +698,8 @@ mod tests {
         assert_eq!(result.occurred_date.as_deref(), Some("2026-08-07"));
         assert_eq!(result.reason_name.as_deref(), Some("办公费"));
         assert_eq!(result.amount_cents, Some(102_850));
+        assert_eq!(decimal_to_cents("￥1，546.69"), Some(154_669));
+        assert!(EXTRACTION_SYSTEM_PROMPT.contains("1,546.69"));
     }
 
     #[test]
@@ -676,14 +733,11 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_reasoning_or_legacy_text() {
+    fn ignores_reasoning_and_keeps_legacy_text_compatibility() {
         let reasoning = json!({
             "choices": [{ "message": { "content": null, "reasoning_content": "{\"amount\":\"9.90\"}" } }]
         });
-        assert_eq!(
-            extract_llm_content(&reasoning).as_deref(),
-            Some("{\"amount\":\"9.90\"}")
-        );
+        assert!(extract_llm_content(&reasoning).is_none());
         let legacy = json!({ "choices": [{ "text": "{\"amount\":\"8.80\"}" }] });
         assert_eq!(
             extract_llm_content(&legacy).as_deref(),
@@ -692,10 +746,33 @@ mod tests {
     }
 
     #[test]
-    fn preserves_response_record_when_content_is_empty() {
-        let response = json!({ "choices": [{ "message": { "content": "" } }] });
-        assert!(extract_llm_content(&response).is_none());
-        assert!(llm_response_record(&response).contains("choices"));
+    fn deepseek_request_disables_thinking_and_requires_json() {
+        let profile = LlmProfile {
+            name: "DeepSeek".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            timeout_seconds: 30,
+        };
+        let endpoint = chat_completions_endpoint(&profile.base_url).expect("endpoint");
+        let request = llm_request_body(&profile, &endpoint, "返回 JSON");
+        assert_eq!(
+            request.pointer("/response_format/type"),
+            Some(&json!("json_object"))
+        );
+        assert_eq!(request.pointer("/thinking/type"), Some(&json!("disabled")));
+
+        let openai = Url::parse("https://api.openai.com/v1/chat/completions").expect("url");
+        let request = llm_request_body(&profile, &openai, "返回 JSON");
+        assert!(request.get("thinking").is_none());
+    }
+
+    #[test]
+    fn keeps_only_normalized_json_as_ai_record() {
+        assert_eq!(
+            normalized_json_record("说明：```json\n{\"amount\":\"18.20\"}\n```"),
+            "{\n  \"amount\": \"18.20\"\n}"
+        );
     }
 
     #[test]
