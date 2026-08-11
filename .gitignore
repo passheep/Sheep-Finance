@@ -1,0 +1,27 @@
+# Local tools and caches
+.codex-tmp/
+.npm-cache/
+app/.codex-tmp/
+app/node_modules/
+
+# Build and test output
+app/dist/
+app/src-tauri/target/
+app/tmp/
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+SheepFinance-配置-*.txt
+
+# Editors and operating systems
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+*.suo
+*.user
