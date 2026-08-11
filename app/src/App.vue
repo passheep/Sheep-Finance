@@ -12,12 +12,14 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import {
   Check,
   Clock,
+  CopyDocument,
   Delete,
   Document,
   DocumentAdd,
   Download,
   EditPen,
   InfoFilled,
+  Iphone,
   Picture,
   Plus,
   Printer,
@@ -30,12 +32,14 @@ import {
   ZoomOut,
 } from "@element-plus/icons-vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import ExcelJS from "exceljs";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { save as tauriSave } from "@tauri-apps/plugin-dialog";
 import { writeFile as tauriWriteFile } from "@tauri-apps/plugin-fs";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import * as QRCode from "qrcode";
 
 type OcrMode = "advanced" | "handwriting";
 type OcrStatus =
@@ -205,6 +209,23 @@ interface EncryptedConfigurationEnvelope {
   iv: string;
   ciphertext: string;
 }
+interface LanUploadSessionInfo {
+  url: string;
+  recordId: string;
+  label: string;
+  expiresAt: number;
+  remainingSlots: number;
+  localAddress: string;
+}
+interface LanUploadReceivedEvent {
+  recordId: string;
+  remainingSlots: number;
+  file: {
+    fileName: string;
+    mimeType: string;
+    dataUrl: string;
+  };
+}
 
 const STORAGE_KEY = "sheepfinance:workbench:v1";
 const PROFILE_KEY = "sheepfinance:profiles:v1";
@@ -319,6 +340,12 @@ const editInput = ref<
   HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null
 >(null);
 const isOcrResultOpen = ref(false);
+const isLanUploadOpen = ref(false);
+const isLanUploadLoading = ref(false);
+const lanUploadSession = ref<LanUploadSessionInfo | null>(null);
+const lanUploadQrCode = ref("");
+const lanUploadError = ref("");
+const lanUploadNow = ref(Date.now());
 const ocrResultExpense = ref<Expense | null>(null);
 const handwritingMode = ref(false);
 const uploadFocused = ref(false);
@@ -343,7 +370,15 @@ const newCompany = ref("");
 const newReason = ref("");
 const newArranger = ref("");
 const saveTimer = ref<number | null>(null);
+const lanReceivedCount = ref(0);
 let autoSaveRevision = 0;
+let lanUploadClockTimer: number | null = null;
+let lanUploadNoticeTimer: number | null = null;
+let lanUploadUnlisten: UnlistenFn | null = null;
+let lanUploadListenerReady: Promise<void> | null = null;
+let lanUploadQueue = Promise.resolve();
+let lanUploadPendingEvents = 0;
+let lanUploadRequestVersion = 0;
 const pointerState = ref<{
   type: "move" | "resize";
   id: string;
@@ -359,6 +394,24 @@ const expenseDragState = ref<{ id: string } | null>(null);
 const selectedExpense = computed(
   () => draft.expenses.find((item) => item.id === selectedId.value) ?? null,
 );
+const lanUploadLabel = computed(
+  () => draft.label.trim() || draft.companyName.trim() || "未命名报销单",
+);
+const lanUploadSecondsRemaining = computed(() =>
+  lanUploadSession.value
+    ? Math.max(
+        0,
+        Math.floor(
+          (lanUploadSession.value.expiresAt - lanUploadNow.value) / 1000,
+        ),
+      )
+    : 0,
+);
+const lanUploadExpiryText = computed(() => {
+  const seconds = lanUploadSecondsRemaining.value;
+  if (!seconds) return "已过期";
+  return `${Math.floor(seconds / 60)}:${`${seconds % 60}`.padStart(2, "0")}`;
+});
 const calculatedTotal = computed(() =>
   draft.expenses.reduce((sum, item) => sum + item.amountCents, 0),
 );
@@ -859,11 +912,20 @@ function readImage(file: File) {
     },
   );
 }
-async function addFile(file: File) {
-  if (!file.type.startsWith("image/"))
-    return ElMessage.warning("请选择图片文件");
-  if (draft.expenses.length >= MAX_EXPENSES)
-    return ElMessage.warning(`一张报销单最多上传${MAX_EXPENSES}张图片`);
+async function addFile(
+  file: File,
+  notify = true,
+  targetRecordId = draft.id,
+) {
+  if (draft.id !== targetRecordId) return false;
+  if (!file.type.startsWith("image/")) {
+    if (notify) ElMessage.warning("请选择图片文件");
+    return false;
+  }
+  if (draft.expenses.length >= MAX_EXPENSES) {
+    if (notify) ElMessage.warning(`一张报销单最多上传${MAX_EXPENSES}张图片`);
+    return false;
+  }
   try {
     const image = await readImage(file);
     const recognitionImageDataUrl = await compressForRecognition(
@@ -871,6 +933,12 @@ async function addFile(file: File) {
       image.width,
       image.height,
     );
+    if (draft.id !== targetRecordId) return false;
+    if (draft.expenses.length >= MAX_EXPENSES) {
+      if (notify)
+        ElMessage.warning(`一张报销单最多上传${MAX_EXPENSES}张图片`);
+      return false;
+    }
     const expense: Expense = {
       id: id("expense"),
       fileName:
@@ -898,22 +966,183 @@ async function addFile(file: File) {
     dirty();
     void scrollExpenseIntoView(expense.id);
     if (recognitionConfigured() && isTauriRuntime()) {
-      ElMessage.success(
-        recognitionImageDataUrl === image.dataUrl
-          ? "图片已加入，开始识别"
-          : "图片已压缩为8MB以内，开始识别",
-      );
-      void recognizeExpense(expense, true);
-    } else {
+      if (notify)
+        ElMessage.success(
+          recognitionImageDataUrl === image.dataUrl
+            ? "图片已加入，开始识别"
+            : "图片已压缩为8MB以内，开始识别",
+        );
+      void recognizeExpense(expense, notify);
+    } else if (notify) {
       ElMessage.success(
         recognitionImageDataUrl === image.dataUrl
           ? "图片已加入费用列表，配置服务后可开始识别"
           : "图片已加入，并生成了8MB以内的识别副本",
       );
     }
+    return true;
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : "图片读取失败");
+    if (notify)
+      ElMessage.error(error instanceof Error ? error.message : "图片读取失败");
+    return false;
   }
+}
+function lanUploadFile(value: LanUploadReceivedEvent["file"]) {
+  const comma = value.dataUrl.indexOf(",");
+  if (comma < 0) throw new Error("手机图片数据格式无效");
+  const binary = atob(value.dataUrl.slice(comma + 1));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1)
+    bytes[index] = binary.charCodeAt(index);
+  return new File([bytes], value.fileName, { type: value.mimeType });
+}
+function showLanUploadReceived() {
+  lanReceivedCount.value += 1;
+  if (lanUploadNoticeTimer !== null) window.clearTimeout(lanUploadNoticeTimer);
+  lanUploadNoticeTimer = window.setTimeout(() => {
+    const count = lanReceivedCount.value;
+    lanReceivedCount.value = 0;
+    lanUploadNoticeTimer = null;
+    ElMessage.success(`已从手机接收 ${count} 张图片`);
+  }, 400);
+}
+async function receiveLanUpload(payload: LanUploadReceivedEvent) {
+  try {
+    if (payload.recordId !== draft.id) return;
+    if (draft.expenses.length >= MAX_EXPENSES) {
+      await synchronizeLanUploadSession();
+      return;
+    }
+    if (lanUploadSession.value)
+      lanUploadSession.value.remainingSlots = payload.remainingSlots;
+    const added = await addFile(
+      lanUploadFile(payload.file),
+      false,
+      payload.recordId,
+    );
+    if (added) showLanUploadReceived();
+  } finally {
+    lanUploadPendingEvents = Math.max(0, lanUploadPendingEvents - 1);
+    if (lanUploadPendingEvents === 0) await synchronizeLanUploadSession();
+  }
+}
+async function ensureLanUploadListener() {
+  if (!isTauriRuntime()) throw new Error("手机上传仅支持在桌面应用中使用");
+  if (lanUploadUnlisten) return;
+  if (!lanUploadListenerReady) {
+    lanUploadListenerReady = listen<LanUploadReceivedEvent>(
+      "lan-upload-received",
+      (event) => {
+        lanUploadPendingEvents += 1;
+        lanUploadQueue = lanUploadQueue
+          .then(() => receiveLanUpload(event.payload))
+          .catch((error) => {
+            ElMessage.error(`手机图片接收失败：${errorMessage(error)}`);
+          });
+      },
+    ).then((unlisten) => {
+      lanUploadUnlisten = unlisten;
+    });
+  }
+  try {
+    await lanUploadListenerReady;
+  } catch (error) {
+    lanUploadListenerReady = null;
+    throw error;
+  }
+}
+async function refreshLanUploadSession() {
+  if (draft.expenses.length >= MAX_EXPENSES) {
+    lanUploadError.value = "当前报销单已达到 10 张图片上限";
+    return;
+  }
+  const requestVersion = ++lanUploadRequestVersion;
+  isLanUploadLoading.value = true;
+  lanUploadError.value = "";
+  lanUploadSession.value = null;
+  lanUploadQrCode.value = "";
+  try {
+    await ensureLanUploadListener();
+    const session = await invoke<LanUploadSessionInfo>(
+      "start_lan_upload_session",
+      {
+        request: {
+          recordId: draft.id,
+          label: lanUploadLabel.value,
+          remainingSlots: MAX_EXPENSES - draft.expenses.length,
+          ttlSeconds: 15 * 60,
+        },
+      },
+    );
+    const qrCode = await QRCode.toDataURL(session.url, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      width: 260,
+      color: { dark: "#31483e", light: "#ffffff" },
+    });
+    if (!isLanUploadOpen.value || requestVersion !== lanUploadRequestVersion)
+      return;
+    lanUploadSession.value = session;
+    lanUploadQrCode.value = qrCode;
+    lanUploadNow.value = Date.now();
+  } catch (error) {
+    if (isLanUploadOpen.value && requestVersion === lanUploadRequestVersion)
+      lanUploadError.value = errorMessage(error);
+  } finally {
+    if (requestVersion === lanUploadRequestVersion)
+      isLanUploadLoading.value = false;
+  }
+}
+async function openLanUpload() {
+  if (!isTauriRuntime())
+    return ElMessage.warning("手机上传仅支持在桌面应用中使用");
+  isLanUploadOpen.value = true;
+  await refreshLanUploadSession();
+}
+async function stopLanUploadSession() {
+  lanUploadRequestVersion += 1;
+  lanUploadSession.value = null;
+  lanUploadQrCode.value = "";
+  lanUploadError.value = "";
+  isLanUploadLoading.value = false;
+  if (!isTauriRuntime()) return;
+  await invoke("stop_lan_upload_session").catch(() => {});
+}
+async function synchronizeLanUploadSession() {
+  const session = lanUploadSession.value;
+  if (
+    !session ||
+    session.recordId !== draft.id ||
+    lanUploadPendingEvents > 0 ||
+    !isTauriRuntime()
+  )
+    return;
+  session.label = lanUploadLabel.value;
+  session.remainingSlots = Math.max(0, MAX_EXPENSES - draft.expenses.length);
+  await invoke("update_lan_upload_session", {
+    request: {
+      recordId: draft.id,
+      label: session.label,
+      remainingSlots: session.remainingSlots,
+    },
+  }).catch(() => {});
+}
+async function copyLanUploadUrl() {
+  const url = lanUploadSession.value?.url;
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {
+    const input = document.createElement("textarea");
+    input.value = url;
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+  ElMessage.success("上传地址已复制");
 }
 async function filesChanged(event: Event) {
   const input = event.target as HTMLInputElement;
@@ -2412,11 +2641,29 @@ watch(
 watch([historySearch, historyDate, historyStatus], () => {
   historyPage.value = 1;
 });
+watch([() => draft.label, () => draft.expenses.length], () => {
+  void synchronizeLanUploadSession();
+});
+watch(
+  () => draft.id,
+  (recordId) => {
+    if (
+      lanUploadSession.value &&
+      lanUploadSession.value.recordId !== recordId
+    ) {
+      isLanUploadOpen.value = false;
+      void stopLanUploadSession();
+    }
+  },
+);
 function preventContextMenu(event: MouseEvent) {
   event.preventDefault();
 }
 onMounted(() => {
   void loadDraft();
+  lanUploadClockTimer = window.setInterval(() => {
+    lanUploadNow.value = Date.now();
+  }, 1000);
   updateScale();
   window.addEventListener("resize", updateScale);
   window.addEventListener("pointerdown", expenseDragStart);
@@ -2430,6 +2677,12 @@ onMounted(() => {
 });
 onUnmounted(() => {
   if (saveTimer.value !== null) window.clearTimeout(saveTimer.value);
+  if (lanUploadClockTimer !== null) window.clearInterval(lanUploadClockTimer);
+  if (lanUploadNoticeTimer !== null) window.clearTimeout(lanUploadNoticeTimer);
+  lanUploadUnlisten?.();
+  lanUploadUnlisten = null;
+  lanUploadListenerReady = null;
+  void stopLanUploadSession();
   window.removeEventListener("resize", updateScale);
   window.removeEventListener("pointerdown", expenseDragStart);
   window.removeEventListener("pointermove", pointerMove);
@@ -2545,9 +2798,19 @@ onUnmounted(() => {
               <span class="eyebrow">STEP 01</span>
               <h2>添加费用截图</h2>
             </div>
-            <el-tag effect="plain" type="info"
-              >{{ draft.expenses.length }}/{{ MAX_EXPENSES }}</el-tag
-            >
+            <div class="upload-panel-actions">
+              <el-button
+                size="small"
+                plain
+                :icon="Iphone"
+                :disabled="draft.expenses.length >= MAX_EXPENSES"
+                @click.stop="openLanUpload"
+                >手机上传</el-button
+              >
+              <el-tag effect="plain" type="info"
+                >{{ draft.expenses.length }}/{{ MAX_EXPENSES }}</el-tag
+              >
+            </div>
           </div>
           <button class="upload-dropzone" type="button" @click="openPicker">
             <span class="upload-icon"><Upload :size="22" /></span
@@ -3362,6 +3625,85 @@ onUnmounted(() => {
         ></template
       >
     </el-dialog>
+    <el-dialog
+      v-model="isLanUploadOpen"
+      title="手机扫码上传"
+      width="520px"
+      destroy-on-close
+      @closed="stopLanUploadSession"
+    >
+      <div v-loading="isLanUploadLoading" class="lan-upload-dialog">
+        <el-alert
+          v-if="lanUploadError"
+          :title="lanUploadError"
+          type="error"
+          :closable="false"
+          show-icon
+        />
+        <template v-if="lanUploadSession && lanUploadQrCode">
+          <div class="lan-upload-main">
+            <img
+              class="lan-upload-qr"
+              :src="lanUploadQrCode"
+              alt="手机上传二维码"
+            />
+            <div class="lan-upload-summary">
+              <span class="eyebrow">CURRENT RECORD</span>
+              <strong>{{ lanUploadLabel }}</strong>
+              <span>编号 {{ draft.id.slice(-12) }}</span>
+              <div class="lan-upload-metrics">
+                <span
+                  ><b>{{ lanUploadSession.remainingSlots }}</b> 个位置</span
+                >
+                <span :class="{ expired: !lanUploadSecondsRemaining }"
+                  ><b>{{ lanUploadExpiryText }}</b> 有效期</span
+                >
+              </div>
+            </div>
+          </div>
+          <el-input
+            :model-value="lanUploadSession.url"
+            readonly
+            aria-label="手机上传地址"
+          >
+            <template #append>
+              <el-button
+                :icon="CopyDocument"
+                title="复制上传地址"
+                @click="copyLanUploadUrl"
+              />
+            </template>
+          </el-input>
+          <div class="lan-upload-network">
+            <span>监听地址 {{ lanUploadSession.localAddress }}</span>
+            <span>手机与电脑需连接同一局域网</span>
+          </div>
+          <el-alert
+            title="手机无法打开时，请允许 SheepFinance 通过 Windows 防火墙，并确认 Wi-Fi 未开启设备隔离。"
+            type="info"
+            :closable="false"
+            show-icon
+          />
+        </template>
+        <div
+          v-else-if="!isLanUploadLoading && !lanUploadError"
+          class="lan-upload-empty"
+        >
+          正在准备局域网上传地址
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="isLanUploadOpen = false">关闭</el-button>
+        <el-button
+          type="primary"
+          :icon="Refresh"
+          :loading="isLanUploadLoading"
+          :disabled="draft.expenses.length >= MAX_EXPENSES"
+          @click="refreshLanUploadSession"
+          >刷新二维码</el-button
+        >
+      </template>
+    </el-dialog>
     <section v-if="activeTab === 'settings'" class="page-shell settings-page">
       <div class="page-heading">
         <div>
@@ -3838,7 +4180,7 @@ onUnmounted(() => {
         <h1>SheepFinance</h1>
         <p>将票据截图识别、核对并排版为报销单的本地桌面工具。</p>
         <div class="about-meta">
-          <span>版本 0.1.4</span><span>Windows 10 x64</span>
+          <span>版本 0.1.5</span><span>Windows 10 x64</span>
         </div>
         <div class="about-links">
           <el-link
@@ -3997,6 +4339,14 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+.upload-panel-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.upload-panel-actions .el-button {
+  margin: 0;
 }
 .eyebrow {
   color: #a06c59;
@@ -4918,6 +5268,81 @@ h3 {
   gap: 8px 18px;
   margin: 14px 0 10px;
   color: #7e8c85;
+  font-size: 12px;
+}
+.lan-upload-dialog {
+  min-height: 335px;
+}
+.lan-upload-dialog > .el-alert {
+  margin-bottom: 14px;
+}
+.lan-upload-main {
+  display: grid;
+  grid-template-columns: 238px minmax(0, 1fr);
+  align-items: center;
+  gap: 22px;
+  margin-bottom: 16px;
+}
+.lan-upload-qr {
+  width: 238px;
+  height: 238px;
+  display: block;
+  border: 1px solid #dce5df;
+  border-radius: 6px;
+  background: #fff;
+}
+.lan-upload-summary {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.lan-upload-summary > strong {
+  overflow: hidden;
+  color: #34483f;
+  font-size: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lan-upload-summary > span:not(.eyebrow) {
+  color: #829089;
+  font-size: 11px;
+}
+.lan-upload-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 9px;
+  padding-top: 12px;
+  border-top: 1px solid #e0e7e2;
+}
+.lan-upload-metrics span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: #87948e;
+  font-size: 10px;
+}
+.lan-upload-metrics b {
+  color: #46665a;
+  font-size: 17px;
+}
+.lan-upload-metrics .expired b {
+  color: #b44f48;
+}
+.lan-upload-network {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 9px 0 13px;
+  color: #829089;
+  font-size: 10px;
+}
+.lan-upload-empty {
+  min-height: 300px;
+  display: grid;
+  place-items: center;
+  color: #8b9892;
   font-size: 12px;
 }
 .recognition-fields {
