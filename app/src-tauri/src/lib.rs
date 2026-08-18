@@ -1,5 +1,6 @@
 mod lan_upload;
 mod recognition;
+mod request_log;
 mod storage;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -14,6 +15,9 @@ pub fn run() {
             lan_upload::update_lan_upload_session,
             lan_upload::stop_lan_upload_session,
             recognition::recognize_expense,
+            request_log::list_request_logs,
+            request_log::get_request_log,
+            request_log::clear_request_logs,
             storage::save_workspace,
             storage::load_workspace,
             storage::load_record,

@@ -10,8 +10,11 @@ import {
 } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
+  ArrowLeftBold,
+  ArrowRightBold,
   Check,
   Clock,
+  Connection,
   CopyDocument,
   Delete,
   Document,
@@ -27,6 +30,7 @@ import {
   Setting,
   Sort,
   Upload,
+  View,
   WarningFilled,
   ZoomIn,
   ZoomOut,
@@ -40,11 +44,12 @@ import { save as tauriSave } from "@tauri-apps/plugin-dialog";
 import { writeFile as tauriWriteFile } from "@tauri-apps/plugin-fs";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import * as QRCode from "qrcode";
+import AttachmentSurface from "./components/AttachmentSurface.vue";
 
 type OcrMode = "advanced" | "handwriting";
 type OcrStatus =
   "queued" | "recognizing" | "success" | "partial" | "error" | "manual";
-type AppTab = "reimbursement" | "history" | "settings" | "about";
+type AppTab = "reimbursement" | "history" | "requests" | "settings" | "about";
 type PreviewMode = "single" | "double";
 type ReimbursementStatus = "未报销" | "报销中" | "已报销";
 type ExpenseEditableField =
@@ -75,6 +80,14 @@ interface RecognizedFields {
   confidence?: Record<string, unknown>;
   evidence?: Record<string, unknown>;
 }
+interface ExtraAttachment {
+  id: string;
+  fileName: string;
+  imageDataUrl: string;
+  naturalWidth: number;
+  naturalHeight: number;
+  transform: Transform;
+}
 interface Expense {
   id: string;
   fileName: string;
@@ -100,7 +113,13 @@ interface Expense {
   transform: Transform;
   naturalWidth: number;
   naturalHeight: number;
+  extraAttachments: ExtraAttachment[];
   manualFields: Record<string, boolean>;
+}
+interface PreviewAttachment extends ExtraAttachment {
+  expenseId: string;
+  isPrimary: boolean;
+  label: string;
 }
 interface Profile {
   id: string;
@@ -157,7 +176,38 @@ interface LlmProfile {
   apiKey: string;
   model: string;
   timeoutSeconds: number;
+  multimodal: boolean;
   isDefault: boolean;
+}
+interface FormExpenseRow {
+  expense: Expense;
+  index: number;
+  height: number;
+}
+interface FormPage {
+  rows: FormExpenseRow[];
+  isFirst: boolean;
+  isLast: boolean;
+}
+interface RequestLogSummary {
+  id: string;
+  service: "ocr" | "llm";
+  recordId: string;
+  expenseId: string;
+  fileName: string;
+  profileName: string;
+  model?: string;
+  action?: string;
+  requestUrl: string;
+  requestedAt: string;
+  durationMs: number;
+  httpStatus?: number;
+  success: boolean;
+  error?: string;
+}
+interface RequestLogRecord extends RequestLogSummary {
+  requestContent: string;
+  responseContent?: string;
 }
 interface RecognitionResponse {
   ocrText: string;
@@ -212,6 +262,7 @@ interface EncryptedConfigurationEnvelope {
 interface LanUploadSessionInfo {
   url: string;
   recordId: string;
+  targetExpenseId?: string;
   label: string;
   expiresAt: number;
   remainingSlots: number;
@@ -219,6 +270,7 @@ interface LanUploadSessionInfo {
 }
 interface LanUploadReceivedEvent {
   recordId: string;
+  targetExpenseId?: string;
   remainingSlots: number;
   file: {
     fileName: string;
@@ -235,6 +287,12 @@ const SERVICE_KEY = "sheepfinance:services:v1";
 const PAGE_WIDTH = 794;
 const PAGE_HEIGHT = 1123;
 const MAX_EXPENSES = 10;
+const ATTACHMENTS_PER_PAGE = 6;
+const MAX_TOTAL_ATTACHMENTS = 30;
+const MAX_ATTACHMENTS_PER_EXPENSE = 10;
+const FIRST_FORM_ROW_BUDGET = 785;
+const CONTINUATION_FORM_ROW_BUDGET = 816;
+const MIN_SHARED_ATTACHMENT_HEIGHT = 126;
 const DEFAULT_LLM_MODEL = "deepseek-v4-flash";
 const REIMBURSEMENT_STATUSES: ReimbursementStatus[] = [
   "未报销",
@@ -282,6 +340,7 @@ const llmProfiles = ref<LlmProfile[]>([
     apiKey: "",
     model: DEFAULT_LLM_MODEL,
     timeoutSeconds: 30,
+    multimodal: false,
     isDefault: true,
   },
 ]);
@@ -332,20 +391,27 @@ function createDraft(): Draft {
 
 const draft = reactive<Draft>(createDraft());
 const selectedId = ref<string | null>(null);
+const selectedAttachmentId = ref<string | null>(null);
 const uploadZone = ref<HTMLElement | null>(null);
 const fileInput = ref<HTMLInputElement | null>(null);
+const extraFileInput = ref<HTMLInputElement | null>(null);
+const extraUploadZone = ref<HTMLElement | null>(null);
 const configImportInput = ref<HTMLInputElement | null>(null);
 const previewViewport = ref<HTMLElement | null>(null);
 const editInput = ref<
   HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null
 >(null);
 const isOcrResultOpen = ref(false);
+const isExtraUploadOpen = ref(false);
+const extraUploadFocused = ref(false);
+const extraUploadExpenseId = ref<string | null>(null);
 const isLanUploadOpen = ref(false);
 const isLanUploadLoading = ref(false);
 const lanUploadSession = ref<LanUploadSessionInfo | null>(null);
 const lanUploadQrCode = ref("");
 const lanUploadError = ref("");
 const lanUploadNow = ref(Date.now());
+const lanUploadTargetExpenseId = ref<string | null>(null);
 const ocrResultExpense = ref<Expense | null>(null);
 const handwritingMode = ref(false);
 const uploadFocused = ref(false);
@@ -365,6 +431,16 @@ const historyDate = ref("");
 const historyStatus = ref<ReimbursementStatus | "">("");
 const historyPage = ref(1);
 const historyPageSize = ref(8);
+const requestRecords = ref<RequestLogSummary[]>([]);
+const requestSearch = ref("");
+const requestService = ref<"ocr" | "llm" | "">("");
+const requestStatus = ref<"success" | "error" | "">("");
+const requestPage = ref(1);
+const requestPageSize = ref(10);
+const isRequestLoading = ref(false);
+const isRequestDetailOpen = ref(false);
+const isRequestDetailLoading = ref(false);
+const requestDetail = ref<RequestLogRecord | null>(null);
 const newCompany = ref("");
 const newReason = ref("");
 const newArranger = ref("");
@@ -387,18 +463,140 @@ const pointerState = ref<{
   y: number;
   width: number;
   height: number;
+  pageIndex: number;
 } | null>(null);
 const expenseDragState = ref<{
   id: string;
   surface: "list" | "paper";
 } | null>(null);
 
-const selectedExpense = computed(
-  () => draft.expenses.find((item) => item.id === selectedId.value) ?? null,
+const extraUploadExpense = computed(
+  () =>
+    draft.expenses.find((item) => item.id === extraUploadExpenseId.value) ??
+    null,
 );
-const lanUploadLabel = computed(
-  () => draft.label.trim() || draft.companyName.trim() || "未命名报销单",
+function wrappedLineCount(value: string, lineCapacity: number) {
+  return Math.max(
+    1,
+    value.split(/\r?\n/).reduce((total, line) => {
+      const width = Array.from(line).reduce(
+        (sum, character) =>
+          sum + (/^[\u0000-\u00ff]$/.test(character) ? 0.55 : 1),
+        0,
+      );
+      return total + Math.max(1, Math.ceil(width / lineCapacity));
+    }, 0),
+  );
+}
+function expenseRowHeight(expense: Expense) {
+  const lines = Math.max(
+    2,
+    wrappedLineCount(expense.description || "", 18),
+    wrappedLineCount(expense.arranger || "", 8),
+  );
+  return Math.max(42, Math.ceil(10 + lines * 15.6));
+}
+const previewAttachments = computed<PreviewAttachment[]>(() =>
+  draft.expenses.flatMap((expense, expenseIndex) => [
+    {
+      id: expense.id,
+      expenseId: expense.id,
+      isPrimary: true,
+      label: `${expenseIndex + 1}`,
+      fileName: expense.fileName,
+      imageDataUrl: expense.imageDataUrl,
+      naturalWidth: expense.naturalWidth,
+      naturalHeight: expense.naturalHeight,
+      transform: expense.transform,
+    },
+    ...expense.extraAttachments.map((attachment, attachmentIndex) => ({
+      ...attachment,
+      expenseId: expense.id,
+      isPrimary: false,
+      label: `${expenseIndex + 1}-${attachmentIndex + 2}`,
+    })),
+  ]),
 );
+function findAttachment(attachmentId: string | null) {
+  if (!attachmentId) return null;
+  return (
+    previewAttachments.value.find((item) => item.id === attachmentId) ?? null
+  );
+}
+const selectedAttachment = computed(() =>
+  findAttachment(selectedAttachmentId.value),
+);
+const formPages = computed<FormPage[]>(() => {
+  const rows = draft.expenses.map((expense, index) => ({
+    expense,
+    index,
+    height: expenseRowHeight(expense),
+  }));
+  if (!rows.length) return [{ rows: [], isFirst: true, isLast: true }];
+
+  const pages: FormExpenseRow[][] = [];
+  let currentRows: FormExpenseRow[] = [];
+  let currentHeight = 0;
+  let budget = FIRST_FORM_ROW_BUDGET;
+  rows.forEach((row) => {
+    if (currentRows.length && currentHeight + row.height > budget) {
+      pages.push(currentRows);
+      currentRows = [];
+      currentHeight = 0;
+      budget = CONTINUATION_FORM_ROW_BUDGET;
+    }
+    currentRows.push(row);
+    currentHeight += row.height;
+  });
+  if (currentRows.length) pages.push(currentRows);
+
+  return pages.map((pageRows, index) => ({
+    rows: pageRows,
+    isFirst: index === 0,
+    isLast: index === pages.length - 1,
+  }));
+});
+const attachmentPages = computed(() => {
+  const pages: PreviewAttachment[][] = [];
+  for (
+    let index = 0;
+    index < previewAttachments.value.length;
+    index += ATTACHMENTS_PER_PAGE
+  ) {
+    pages.push(
+      previewAttachments.value.slice(index, index + ATTACHMENTS_PER_PAGE),
+    );
+  }
+  return pages;
+});
+const lastFormPageRemainingHeight = computed(() => {
+  const page = formPages.value[formPages.value.length - 1];
+  const rowHeight = page.rows.reduce((sum, row) => sum + row.height, 0);
+  const fixedHeight = page.isFirst ? 281 : 250;
+  return PAGE_HEIGHT - 57 - fixedHeight - rowHeight;
+});
+const sharedAttachmentPage = computed(() =>
+  draft.previewMode === "single" &&
+  formPages.value.length === 1 &&
+  attachmentPages.value.length > 0 &&
+  lastFormPageRemainingHeight.value >= MIN_SHARED_ATTACHMENT_HEIGHT
+    ? attachmentPages.value[0]
+    : null,
+);
+const separateAttachmentPages = computed(() =>
+  sharedAttachmentPage.value
+    ? attachmentPages.value.slice(1)
+    : attachmentPages.value,
+);
+const previewPageCount = computed(
+  () => formPages.value.length + separateAttachmentPages.value.length,
+);
+const lanUploadLabel = computed(() => {
+  const base = draft.label.trim() || draft.companyName.trim() || "未命名报销单";
+  return lanUploadTargetExpenseId.value
+    ? `${base} · 费用 ${draft.expenses.findIndex((item) => item.id === lanUploadTargetExpenseId.value) + 1} 附图`
+    : base;
+});
 const lanUploadSecondsRemaining = computed(() =>
   lanUploadSession.value
     ? Math.max(
@@ -426,6 +624,10 @@ const paperSize = computed(() => ({
   "--paper-scale": `${displayScale.value}`,
   "--scaled-paper-width": `${PAGE_WIDTH * displayScale.value}px`,
   "--scaled-paper-height": `${PAGE_HEIGHT * displayScale.value}px`,
+  "--scaled-preview-height": `${
+    PAGE_HEIGHT * displayScale.value * previewPageCount.value +
+    28 * displayScale.value * Math.max(0, previewPageCount.value - 1)
+  }px`,
 }));
 const defaultOcrProfile = computed(
   () =>
@@ -464,6 +666,28 @@ const pagedHistory = computed(() =>
   filteredHistory.value.slice(
     (historyPage.value - 1) * historyPageSize.value,
     historyPage.value * historyPageSize.value,
+  ),
+);
+const filteredRequests = computed(() => {
+  const keyword = requestSearch.value.trim().toLowerCase();
+  return requestRecords.value.filter((item) => {
+    const matchesKeyword =
+      !keyword ||
+      `${item.fileName} ${item.profileName} ${item.model ?? ""} ${item.action ?? ""} ${item.requestUrl} ${item.error ?? ""}`
+        .toLowerCase()
+        .includes(keyword);
+    const matchesService =
+      !requestService.value || item.service === requestService.value;
+    const matchesStatus =
+      !requestStatus.value ||
+      (requestStatus.value === "success" ? item.success : !item.success);
+    return matchesKeyword && matchesService && matchesStatus;
+  });
+});
+const pagedRequests = computed(() =>
+  filteredRequests.value.slice(
+    (requestPage.value - 1) * requestPageSize.value,
+    requestPage.value * requestPageSize.value,
   ),
 );
 const currentProfileId = computed({
@@ -761,6 +985,9 @@ async function recognizeExpense(expense: Expense, notify = true) {
   try {
     const result = await invoke<RecognitionResponse>("recognize_expense", {
       request: {
+        recordId: draft.id,
+        expenseId: expense.id,
+        fileName: expense.fileName,
         imageDataUrl: expense.recognitionImageDataUrl ?? expense.imageDataUrl,
         ocrMode: expense.ocrMode,
         ocrProfile: {
@@ -777,6 +1004,7 @@ async function recognizeExpense(expense: Expense, notify = true) {
           apiKey: llmProfile.apiKey,
           model: llmProfile.model,
           timeoutSeconds: Number(llmProfile.timeoutSeconds) || 30,
+          multimodal: llmProfile.multimodal,
         },
         reasonDictionary: expenseReasons.value,
       },
@@ -835,18 +1063,34 @@ async function recognizeExpense(expense: Expense, notify = true) {
 
 function selectExpense(expense: Expense) {
   selectedId.value = expense.id;
+  selectedAttachmentId.value = expense.id;
 }
-function reflowExpenses() {
-  draft.expenses.forEach((item, index) => {
-    const slot = transform(index, draft.expenses.length);
-    item.transform = {
-      ...item.transform,
+function selectAttachment(
+  attachment: Pick<PreviewAttachment, "id" | "expenseId">,
+) {
+  selectedId.value = attachment.expenseId;
+  selectedAttachmentId.value = attachment.id;
+}
+function reflowAttachments() {
+  const attachments = previewAttachments.value;
+  attachments.forEach((attachment, index) => {
+    const pageStart =
+      Math.floor(index / ATTACHMENTS_PER_PAGE) * ATTACHMENTS_PER_PAGE;
+    const pageTotal = Math.min(
+      ATTACHMENTS_PER_PAGE,
+      attachments.length - pageStart,
+    );
+    const slot = transform(index - pageStart, pageTotal);
+    Object.assign(attachment.transform, {
       x: slot.x,
       y: slot.y,
       width: slot.width,
       height: slot.height,
-    };
+    });
   });
+}
+function reflowExpenses() {
+  reflowAttachments();
 }
 async function scrollExpenseIntoView(expenseId: string) {
   await nextTick();
@@ -920,8 +1164,14 @@ async function addFile(file: File, notify = true, targetRecordId = draft.id) {
     if (notify) ElMessage.warning("请选择图片文件");
     return false;
   }
-  if (draft.expenses.length >= MAX_EXPENSES) {
-    if (notify) ElMessage.warning(`一张报销单最多上传${MAX_EXPENSES}张图片`);
+  if (
+    draft.expenses.length >= MAX_EXPENSES ||
+    previewAttachments.value.length >= MAX_TOTAL_ATTACHMENTS
+  ) {
+    if (notify)
+      ElMessage.warning(
+        `一张报销单最多 ${MAX_EXPENSES} 笔费用、${MAX_TOTAL_ATTACHMENTS} 张图片`,
+      );
     return false;
   }
   try {
@@ -932,8 +1182,14 @@ async function addFile(file: File, notify = true, targetRecordId = draft.id) {
       image.height,
     );
     if (draft.id !== targetRecordId) return false;
-    if (draft.expenses.length >= MAX_EXPENSES) {
-      if (notify) ElMessage.warning(`一张报销单最多上传${MAX_EXPENSES}张图片`);
+    if (
+      draft.expenses.length >= MAX_EXPENSES ||
+      previewAttachments.value.length >= MAX_TOTAL_ATTACHMENTS
+    ) {
+      if (notify)
+        ElMessage.warning(
+          `一张报销单最多 ${MAX_EXPENSES} 笔费用、${MAX_TOTAL_ATTACHMENTS} 张图片`,
+        );
       return false;
     }
     const expense: Expense = {
@@ -955,11 +1211,13 @@ async function addFile(file: File, notify = true, targetRecordId = draft.id) {
       transform: transform(draft.expenses.length, draft.expenses.length + 1),
       naturalWidth: image.width,
       naturalHeight: image.height,
+      extraAttachments: [],
       manualFields: {},
     };
     draft.expenses.push(expense);
     reflowExpenses();
     selectedId.value = expense.id;
+    selectedAttachmentId.value = expense.id;
     dirty();
     void scrollExpenseIntoView(expense.id);
     if (recognitionConfigured() && isTauriRuntime()) {
@@ -984,6 +1242,161 @@ async function addFile(file: File, notify = true, targetRecordId = draft.id) {
     return false;
   }
 }
+function extraAttachmentSlots(expense: Expense) {
+  return Math.max(
+    0,
+    Math.min(
+      MAX_ATTACHMENTS_PER_EXPENSE - expense.extraAttachments.length - 1,
+      MAX_TOTAL_ATTACHMENTS - previewAttachments.value.length,
+    ),
+  );
+}
+function lanUploadRemainingSlots(
+  targetExpenseId: string | null = lanUploadTargetExpenseId.value,
+) {
+  if (targetExpenseId) {
+    const expense = draft.expenses.find((item) => item.id === targetExpenseId);
+    return expense ? Math.min(10, extraAttachmentSlots(expense)) : 0;
+  }
+  return Math.max(
+    0,
+    Math.min(
+      MAX_EXPENSES - draft.expenses.length,
+      MAX_TOTAL_ATTACHMENTS - previewAttachments.value.length,
+    ),
+  );
+}
+async function addExtraAttachmentFile(
+  file: File,
+  expenseId: string,
+  notify = true,
+  targetRecordId = draft.id,
+) {
+  if (draft.id !== targetRecordId) return false;
+  const expense = draft.expenses.find((item) => item.id === expenseId);
+  if (!expense) return false;
+  if (!file.type.startsWith("image/")) {
+    if (notify) ElMessage.warning("请选择图片文件");
+    return false;
+  }
+  if (!extraAttachmentSlots(expense)) {
+    if (notify)
+      ElMessage.warning(
+        `每笔费用最多 ${MAX_ATTACHMENTS_PER_EXPENSE} 张图片，整张报销单最多 ${MAX_TOTAL_ATTACHMENTS} 张`,
+      );
+    return false;
+  }
+  try {
+    const image = await readImage(file);
+    const current = draft.expenses.find((item) => item.id === expenseId);
+    if (
+      !current ||
+      draft.id !== targetRecordId ||
+      !extraAttachmentSlots(current)
+    )
+      return false;
+    const attachment: ExtraAttachment = {
+      id: id("attachment"),
+      fileName:
+        file.name ||
+        `附加图片-${current.extraAttachments.length + 1}-${Date.now()}.png`,
+      imageDataUrl: image.dataUrl,
+      naturalWidth: image.width,
+      naturalHeight: image.height,
+      transform: transform(0, 1),
+    };
+    current.extraAttachments.push(attachment);
+    reflowAttachments();
+    selectedId.value = current.id;
+    selectedAttachmentId.value = attachment.id;
+    dirty();
+    if (notify) ElMessage.success("附加图片已加入，不会执行 OCR 或大模型识别");
+    return true;
+  } catch (error) {
+    if (notify)
+      ElMessage.error(error instanceof Error ? error.message : "图片读取失败");
+    return false;
+  }
+}
+function openExtraUpload(expense: Expense) {
+  extraUploadExpenseId.value = expense.id;
+  isExtraUploadOpen.value = true;
+  nextTick(() => extraUploadZone.value?.focus());
+}
+function openExtraPicker() {
+  extraUploadZone.value?.focus();
+  extraFileInput.value?.click();
+}
+async function extraFilesChanged(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const expense = extraUploadExpense.value;
+  if (expense) {
+    for (const file of Array.from(input.files ?? []))
+      await addExtraAttachmentFile(file, expense.id);
+  }
+  input.value = "";
+}
+async function extraDropped(event: DragEvent) {
+  extraUploadFocused.value = true;
+  const expense = extraUploadExpense.value;
+  if (!expense) return;
+  for (const file of Array.from(event.dataTransfer?.files ?? []))
+    await addExtraAttachmentFile(file, expense.id);
+}
+async function extraPasted(event: ClipboardEvent) {
+  if (!extraUploadFocused.value || !extraUploadExpense.value) return;
+  const item = Array.from(event.clipboardData?.items ?? []).find((value) =>
+    value.type.startsWith("image/"),
+  );
+  if (!item) return;
+  event.preventDefault();
+  const file = item.getAsFile();
+  if (file) await addExtraAttachmentFile(file, extraUploadExpense.value.id);
+}
+async function removeExtraAttachment(
+  expense: Expense,
+  attachment: ExtraAttachment,
+) {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除附加图片“${attachment.fileName}”吗？`,
+      "删除附加图片",
+      { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" },
+    );
+    const index = expense.extraAttachments.findIndex(
+      (item) => item.id === attachment.id,
+    );
+    if (index < 0) return;
+    expense.extraAttachments.splice(index, 1);
+    reflowAttachments();
+    selectedAttachmentId.value = expense.id;
+    selectedId.value = expense.id;
+    dirty();
+    ElMessage.success("附加图片已删除");
+  } catch {
+    /* 用户取消 */
+  }
+}
+function moveExtraAttachment(
+  expense: Expense,
+  attachment: ExtraAttachment,
+  offset: number,
+) {
+  const index = expense.extraAttachments.findIndex(
+    (item) => item.id === attachment.id,
+  );
+  const nextIndex = index + offset;
+  if (
+    index < 0 ||
+    nextIndex < 0 ||
+    nextIndex >= expense.extraAttachments.length
+  )
+    return;
+  const [current] = expense.extraAttachments.splice(index, 1);
+  expense.extraAttachments.splice(nextIndex, 0, current);
+  reflowAttachments();
+  dirty();
+}
 function lanUploadFile(value: LanUploadReceivedEvent["file"]) {
   const comma = value.dataUrl.indexOf(",");
   if (comma < 0) throw new Error("手机图片数据格式无效");
@@ -1006,17 +1419,25 @@ function showLanUploadReceived() {
 async function receiveLanUpload(payload: LanUploadReceivedEvent) {
   try {
     if (payload.recordId !== draft.id) return;
-    if (draft.expenses.length >= MAX_EXPENSES) {
+    const targetExpenseId = payload.targetExpenseId ?? null;
+    if (!lanUploadRemainingSlots(targetExpenseId)) {
       await synchronizeLanUploadSession();
       return;
     }
-    if (lanUploadSession.value)
+    if (
+      lanUploadSession.value &&
+      (lanUploadSession.value.targetExpenseId ?? null) === targetExpenseId
+    )
       lanUploadSession.value.remainingSlots = payload.remainingSlots;
-    const added = await addFile(
-      lanUploadFile(payload.file),
-      false,
-      payload.recordId,
-    );
+    const file = lanUploadFile(payload.file);
+    const added = targetExpenseId
+      ? await addExtraAttachmentFile(
+          file,
+          targetExpenseId,
+          false,
+          payload.recordId,
+        )
+      : await addFile(file, false, payload.recordId);
     if (added) showLanUploadReceived();
   } finally {
     lanUploadPendingEvents = Math.max(0, lanUploadPendingEvents - 1);
@@ -1049,8 +1470,11 @@ async function ensureLanUploadListener() {
   }
 }
 async function refreshLanUploadSession() {
-  if (draft.expenses.length >= MAX_EXPENSES) {
-    lanUploadError.value = "当前报销单已达到 10 张图片上限";
+  const remainingSlots = lanUploadRemainingSlots();
+  if (!remainingSlots) {
+    lanUploadError.value = lanUploadTargetExpenseId.value
+      ? `当前费用已达到 ${MAX_ATTACHMENTS_PER_EXPENSE} 张图片上限，或报销单已达到 ${MAX_TOTAL_ATTACHMENTS} 张图片上限`
+      : `当前报销单已达到 ${MAX_EXPENSES} 笔费用上限`;
     return;
   }
   const requestVersion = ++lanUploadRequestVersion;
@@ -1065,8 +1489,9 @@ async function refreshLanUploadSession() {
       {
         request: {
           recordId: draft.id,
+          targetExpenseId: lanUploadTargetExpenseId.value,
           label: lanUploadLabel.value,
-          remainingSlots: MAX_EXPENSES - draft.expenses.length,
+          remainingSlots,
           ttlSeconds: 15 * 60,
         },
       },
@@ -1090,9 +1515,10 @@ async function refreshLanUploadSession() {
       isLanUploadLoading.value = false;
   }
 }
-async function openLanUpload() {
+async function openLanUpload(expense?: Expense) {
   if (!isTauriRuntime())
     return ElMessage.warning("手机上传仅支持在桌面应用中使用");
+  lanUploadTargetExpenseId.value = expense?.id ?? null;
   isLanUploadOpen.value = true;
   await refreshLanUploadSession();
 }
@@ -1104,6 +1530,7 @@ async function stopLanUploadSession() {
   isLanUploadLoading.value = false;
   if (!isTauriRuntime()) return;
   await invoke("stop_lan_upload_session").catch(() => {});
+  lanUploadTargetExpenseId.value = null;
 }
 async function synchronizeLanUploadSession() {
   const session = lanUploadSession.value;
@@ -1115,10 +1542,11 @@ async function synchronizeLanUploadSession() {
   )
     return;
   session.label = lanUploadLabel.value;
-  session.remainingSlots = Math.max(0, MAX_EXPENSES - draft.expenses.length);
+  session.remainingSlots = lanUploadRemainingSlots();
   await invoke("update_lan_upload_session", {
     request: {
       recordId: draft.id,
+      targetExpenseId: lanUploadTargetExpenseId.value,
       label: session.label,
       remainingSlots: session.remainingSlots,
     },
@@ -1173,6 +1601,7 @@ async function removeExpense(expense: Expense) {
     draft.expenses.splice(index, 1);
     reflowExpenses();
     selectedId.value = draft.expenses[Math.max(0, index - 1)]?.id ?? null;
+    selectedAttachmentId.value = selectedId.value;
     dirty();
     ElMessage.success("费用已删除");
   } catch {
@@ -1248,50 +1677,52 @@ function updateScale() {
 }
 function pointerStart(
   event: PointerEvent,
-  expense: Expense,
+  attachment: Pick<PreviewAttachment, "id" | "expenseId" | "transform">,
   type: "move" | "resize",
+  pageIndex: number,
 ) {
   event.preventDefault();
   event.stopPropagation();
-  selectedId.value = expense.id;
-  const t = expense.transform;
+  selectAttachment(attachment);
+  const t = attachment.transform;
   pointerState.value = {
     type,
-    id: expense.id,
+    id: attachment.id,
     startX: event.clientX,
     startY: event.clientY,
     x: t.x,
     y: t.y,
     width: t.width,
     height: t.height,
+    pageIndex,
   };
 }
 function pointerMove(event: PointerEvent) {
   const state = pointerState.value;
-  const expense = draft.expenses.find((item) => item.id === state?.id);
-  const area = document.querySelector(
-    ".attachment-area.active-attachment-area",
-  ) as HTMLElement | null;
-  if (!state || !expense || !area) return;
+  const attachment = findAttachment(state?.id ?? null);
+  const area = document.querySelector<HTMLElement>(
+    `.attachment-area[data-attachment-page-index="${state?.pageIndex}"]`,
+  );
+  if (!state || !attachment || !area) return;
   const rect = area.getBoundingClientRect();
   const dx = ((event.clientX - state.startX) / rect.width) * 100;
   const dy = ((event.clientY - state.startY) / rect.height) * 100;
   if (state.type === "move") {
-    expense.transform.x = Math.min(
-      100 - expense.transform.width,
+    attachment.transform.x = Math.min(
+      100 - attachment.transform.width,
       Math.max(0, state.x + dx),
     );
-    expense.transform.y = Math.min(
-      100 - expense.transform.height,
+    attachment.transform.y = Math.min(
+      100 - attachment.transform.height,
       Math.max(0, state.y + dy),
     );
   } else {
-    expense.transform.width = Math.min(
-      100 - expense.transform.x,
+    attachment.transform.width = Math.min(
+      100 - attachment.transform.x,
       Math.max(12, state.width + dx),
     );
-    expense.transform.height = Math.min(
-      100 - expense.transform.y,
+    attachment.transform.height = Math.min(
+      100 - attachment.transform.y,
       Math.max(8, state.height + dy),
     );
   }
@@ -1306,26 +1737,24 @@ function adjustImageByWheel(event: WheelEvent) {
       ? event.target.closest(".attachment-object")
       : null;
   if (!target) return;
-  const index = Array.from(
-    document.querySelectorAll(".attachment-object"),
-  ).indexOf(target);
-  const expense = draft.expenses[index];
+  const attachmentId = target.getAttribute("data-attachment-id");
+  const attachment = findAttachment(attachmentId);
   const delta = event.deltaY || event.deltaX;
-  if (!expense || !delta) return;
+  if (!attachment || !delta) return;
   event.preventDefault();
   event.stopPropagation();
-  selectedId.value = expense.id;
+  selectAttachment(attachment);
   const change =
     Math.sign(delta) * Math.max(1, Math.min(5, Math.abs(delta) / 20));
   if (event.shiftKey)
-    expense.transform.cropX = Math.min(
+    attachment.transform.cropX = Math.min(
       100,
-      Math.max(0, expense.transform.cropX + change),
+      Math.max(0, attachment.transform.cropX + change),
     );
   else
-    expense.transform.cropY = Math.min(
+    attachment.transform.cropY = Math.min(
       100,
-      Math.max(0, expense.transform.cropY + change),
+      Math.max(0, attachment.transform.cropY + change),
     );
   dirty();
 }
@@ -1347,19 +1776,43 @@ function adjustPreviewZoom(event: WheelEvent) {
   changePreviewZoom(event.deltaY < 0 ? 0.1 : -0.1);
 }
 function rotate() {
-  if (selectedExpense.value) {
-    selectedExpense.value.transform.rotation =
-      (selectedExpense.value.transform.rotation + 90) % 360;
+  if (selectedAttachment.value) {
+    selectedAttachment.value.transform.rotation =
+      (selectedAttachment.value.transform.rotation + 90) % 360;
     dirty();
   }
 }
 function resetImage() {
-  if (selectedExpense.value) {
-    const index = draft.expenses.findIndex(
-      (item) => item.id === selectedExpense.value?.id,
+  if (selectedAttachment.value) {
+    const index = previewAttachments.value.findIndex(
+      (item) => item.id === selectedAttachment.value?.id,
     );
-    selectedExpense.value.transform = transform(index, draft.expenses.length);
+    const pageStart =
+      Math.floor(index / ATTACHMENTS_PER_PAGE) * ATTACHMENTS_PER_PAGE;
+    const pageTotal = Math.min(
+      ATTACHMENTS_PER_PAGE,
+      previewAttachments.value.length - pageStart,
+    );
+    Object.assign(
+      selectedAttachment.value.transform,
+      transform(index - pageStart, pageTotal),
+    );
     dirty();
+  }
+}
+async function removeSelectedAttachment() {
+  const attachment = selectedAttachment.value;
+  if (!attachment) return;
+  const expense = draft.expenses.find(
+    (item) => item.id === attachment.expenseId,
+  );
+  if (!expense) return;
+  if (attachment.isPrimary) await removeExpense(expense);
+  else {
+    const extra = expense.extraAttachments.find(
+      (item) => item.id === attachment.id,
+    );
+    if (extra) await removeExtraAttachment(expense, extra);
   }
 }
 function printCurrentPage() {
@@ -1489,6 +1942,7 @@ function applyDraft(value: Draft) {
     normalizeExpense(item, index, expenses.length),
   );
   selectedId.value = draft.expenses[0]?.id ?? null;
+  selectedAttachmentId.value = selectedId.value;
 }
 function applyWorkspace(value: LoadedWorkspace) {
   if (value.draft?.id) applyDraft(value.draft);
@@ -1729,6 +2183,7 @@ function addLlmProfile() {
     apiKey: "",
     model: DEFAULT_LLM_MODEL,
     timeoutSeconds: 30,
+    multimodal: false,
     isDefault: false,
   });
   dirty();
@@ -1754,9 +2209,70 @@ function removeLlmProfile(profile: LlmProfile) {
 function switchTab(tab: AppTab) {
   commitActiveEdit();
   activeTab.value = tab;
+  if (tab === "requests") void loadRequestLogs();
   nextTick(() => {
     if (tab === "reimbursement") updateScale();
   });
+}
+function requestServiceLabel(service: RequestLogSummary["service"]) {
+  return service === "ocr" ? "OCR" : "大模型";
+}
+function formatRequestTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString("zh-CN", { hour12: false });
+}
+async function loadRequestLogs() {
+  if (!isTauriRuntime()) {
+    requestRecords.value = [];
+    return;
+  }
+  isRequestLoading.value = true;
+  try {
+    requestRecords.value =
+      await invoke<RequestLogSummary[]>("list_request_logs");
+  } catch (error) {
+    ElMessage.error(`请求记录读取失败：${errorMessage(error)}`);
+  } finally {
+    isRequestLoading.value = false;
+  }
+}
+async function openRequestDetail(item: RequestLogSummary) {
+  if (!isTauriRuntime()) return;
+  isRequestDetailOpen.value = true;
+  isRequestDetailLoading.value = true;
+  requestDetail.value = null;
+  try {
+    requestDetail.value = await invoke<RequestLogRecord>("get_request_log", {
+      id: item.id,
+    });
+  } catch (error) {
+    ElMessage.error(`请求详情读取失败：${errorMessage(error)}`);
+    isRequestDetailOpen.value = false;
+  } finally {
+    isRequestDetailLoading.value = false;
+  }
+}
+async function clearRequestLogs() {
+  if (!requestRecords.value.length || !isTauriRuntime()) return;
+  try {
+    await ElMessageBox.confirm(
+      "确定清空本机保存的全部 OCR 和大模型请求记录吗？",
+      "清空请求记录",
+      { confirmButtonText: "清空", cancelButtonText: "取消", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  try {
+    await invoke("clear_request_logs");
+    requestRecords.value = [];
+    requestDetail.value = null;
+    ElMessage.success("请求记录已清空");
+  } catch (error) {
+    ElMessage.error(`请求记录清空失败：${errorMessage(error)}`);
+  }
 }
 function newRecord() {
   commitActiveEdit();
@@ -1764,11 +2280,27 @@ function newRecord() {
   if (!isSaved.value || draft.expenses.length) void persistDraft(false);
   Object.assign(draft, createDraft());
   selectedId.value = null;
+  selectedAttachmentId.value = null;
   dirty();
   ElMessage.success("已创建新的空白报销单");
 }
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+function normalizeExtraAttachment(
+  value: Partial<ExtraAttachment>,
+  index: number,
+  total: number,
+): ExtraAttachment {
+  const fallbackTransform = transform(index, total);
+  return {
+    id: value.id ?? id("attachment"),
+    fileName: value.fileName ?? `附加图片-${index + 1}.png`,
+    imageDataUrl: value.imageDataUrl ?? "",
+    naturalWidth: value.naturalWidth ?? 1,
+    naturalHeight: value.naturalHeight ?? 1,
+    transform: { ...fallbackTransform, ...(value.transform ?? {}) },
+  };
 }
 function normalizeExpense(
   value: Partial<Expense>,
@@ -1808,6 +2340,14 @@ function normalizeExpense(
     transform: { ...fallbackTransform, ...(value.transform ?? {}) },
     naturalWidth: value.naturalWidth ?? 1,
     naturalHeight: value.naturalHeight ?? 1,
+    extraAttachments: (value.extraAttachments ?? []).map(
+      (attachment, extraIndex) =>
+        normalizeExtraAttachment(
+          attachment,
+          extraIndex + 1,
+          (value.extraAttachments?.length ?? 0) + 1,
+        ),
+    ),
     manualFields: value.manualFields ?? {},
   };
 }
@@ -1836,6 +2376,7 @@ function normalizeLlmProfile(value: Partial<LlmProfile>): LlmProfile {
     apiKey: value.apiKey ?? "",
     model,
     timeoutSeconds: Number(value.timeoutSeconds) || 30,
+    multimodal: Boolean(value.multimodal),
     isDefault: Boolean(value.isDefault),
   };
 }
@@ -2186,17 +2727,23 @@ async function captureElementForExport(
     host.remove();
   }
 }
-async function captureAttachmentForExport() {
-  const source = document.querySelector<HTMLElement>(
-    ".attachment-area.active-attachment-area",
+async function captureAttachmentPagesForExport() {
+  const sources = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      ".attachment-area[data-export-attachment-page]",
+    ),
   );
-  if (!source) throw new Error("附件预览尚未准备完成，请稍后重试");
-  const width = Math.round(source.clientWidth);
-  const height = Math.round(source.clientHeight);
-  if (width <= 0 || height <= 0)
-    throw new Error("附件预览尺寸异常，请稍后重试");
-  const canvas = await captureElementForExport(source, width, height);
-  return { dataUrl: canvas.toDataURL("image/png"), width, height };
+  if (!sources.length) throw new Error("附件预览尚未准备完成，请稍后重试");
+  const pages: { dataUrl: string; width: number; height: number }[] = [];
+  for (const source of sources) {
+    const width = Math.round(source.clientWidth);
+    const height = Math.round(source.clientHeight);
+    if (width <= 0 || height <= 0)
+      throw new Error("附件预览尺寸异常，请稍后重试");
+    const canvas = await captureElementForExport(source, width, height);
+    pages.push({ dataUrl: canvas.toDataURL("image/png"), width, height });
+  }
+  return pages;
 }
 async function saveExportBytes(
   bytes: Uint8Array,
@@ -2238,7 +2785,7 @@ async function exportExcel() {
       await nextTick();
     }
 
-    const attachment = await captureAttachmentForExport();
+    const attachmentPagesForExport = await captureAttachmentPagesForExport();
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "SheepFinance";
     workbook.created = new Date();
@@ -2293,8 +2840,9 @@ async function exportExcel() {
     sheet.getRow(1).height = 32.25;
     sheet.getRow(2).height = 23.25;
     sheet.getRow(3).height = 25.5;
-    draft.expenses.forEach((_expense, index) => {
-      sheet.getRow(expenseStartRow + index).height = 31.5;
+    draft.expenses.forEach((expense, index) => {
+      sheet.getRow(expenseStartRow + index).height =
+        expenseRowHeight(expense) * 0.75;
     });
     sheet.getRow(totalRow).height = 23.25;
     sheet.getRow(uppercaseRow).height = 23.25;
@@ -2371,7 +2919,7 @@ async function exportExcel() {
           horizontal: "center",
           vertical: "middle",
           wrapText: true,
-          shrinkToFit: column !== 4,
+          shrinkToFit: column !== 4 && column !== 5,
         };
       }
     });
@@ -2441,39 +2989,51 @@ async function exportExcel() {
     for (let column = 7; column <= 13; column += 1)
       sheet.getRow(5).getCell(column).border = {};
 
-    const attachmentStartRow = approvalRow + 1;
-    const attachmentHeightPoints = attachment.height * 0.75;
-    const attachmentRowCount = Math.max(
-      1,
-      Math.ceil(attachmentHeightPoints / 300),
-    );
-    const attachmentEndRow = attachmentStartRow + attachmentRowCount - 1;
-    for (
-      let rowNumber = attachmentStartRow;
-      rowNumber <= attachmentEndRow;
-      rowNumber += 1
-    ) {
-      sheet.getRow(rowNumber).height =
-        attachmentHeightPoints / attachmentRowCount;
-    }
-
-    const attachmentImageId = workbook.addImage({
-      base64: attachment.dataUrl,
-      extension: "png",
+    formPages.value.slice(0, -1).forEach((page) => {
+      const lastRow = page.rows[page.rows.length - 1];
+      if (lastRow) sheet.getRow(expenseStartRow + lastRow.index).addPageBreak();
     });
-    sheet.addImage(attachmentImageId, {
-      tl: { col: 0, row: attachmentStartRow - 1 },
-      br: { col: 6, row: attachmentEndRow },
-      editAs: "oneCell",
-    } as any);
 
-    if (draft.previewMode === "double")
-      sheet.getRow(approvalRow).addPageBreak();
+    let nextAttachmentRow = approvalRow + 1;
+    let attachmentEndRow = approvalRow;
+    if (!sharedAttachmentPage.value) sheet.getRow(approvalRow).addPageBreak();
+    attachmentPagesForExport.forEach((attachment, index) => {
+      const attachmentStartRow = nextAttachmentRow;
+      const attachmentHeightPoints = attachment.height * 0.75;
+      const attachmentRowCount = Math.max(
+        1,
+        Math.ceil(attachmentHeightPoints / 300),
+      );
+      attachmentEndRow = attachmentStartRow + attachmentRowCount - 1;
+      for (
+        let rowNumber = attachmentStartRow;
+        rowNumber <= attachmentEndRow;
+        rowNumber += 1
+      ) {
+        sheet.getRow(rowNumber).height =
+          attachmentHeightPoints / attachmentRowCount;
+      }
+
+      const attachmentImageId = workbook.addImage({
+        base64: attachment.dataUrl,
+        extension: "png",
+      });
+      sheet.addImage(attachmentImageId, {
+        tl: { col: 0, row: attachmentStartRow - 1 },
+        br: { col: 6, row: attachmentEndRow },
+        editAs: "oneCell",
+      } as any);
+      if (index < attachmentPagesForExport.length - 1)
+        sheet.getRow(attachmentEndRow).addPageBreak();
+      nextAttachmentRow = attachmentEndRow + 1;
+    });
+
     sheet.pageSetup.orientation = "portrait";
     sheet.pageSetup.paperSize = 9;
     sheet.pageSetup.fitToPage = true;
     sheet.pageSetup.fitToWidth = 1;
-    sheet.pageSetup.fitToHeight = draft.previewMode === "double" ? 2 : 1;
+    sheet.pageSetup.fitToHeight = previewPageCount.value;
+    sheet.pageSetup.printTitlesRow = "1:3";
     sheet.pageSetup.margins = {
       left: 0.38,
       right: 0.38,
@@ -2521,7 +3081,7 @@ async function exportPdf() {
     const pages = Array.from(
       document.querySelectorAll<HTMLElement>(".preview-pages .paper"),
     );
-    const expectedPages = draft.previewMode === "double" ? 2 : 1;
+    const expectedPages = previewPageCount.value;
     if (pages.length !== expectedPages)
       throw new Error("PDF 页面尚未准备完成，请稍后重试");
 
@@ -2632,9 +3192,19 @@ watch(
 watch([historySearch, historyDate, historyStatus], () => {
   historyPage.value = 1;
 });
-watch([() => draft.label, () => draft.expenses.length], () => {
-  void synchronizeLanUploadSession();
+watch([requestSearch, requestService, requestStatus], () => {
+  requestPage.value = 1;
 });
+watch(
+  [
+    () => draft.label,
+    () => previewAttachments.value.length,
+    lanUploadTargetExpenseId,
+  ],
+  () => {
+    void synchronizeLanUploadSession();
+  },
+);
 watch(
   () => draft.id,
   (recordId) => {
@@ -2645,6 +3215,8 @@ watch(
       isLanUploadOpen.value = false;
       void stopLanUploadSession();
     }
+    isExtraUploadOpen.value = false;
+    extraUploadExpenseId.value = null;
   },
 );
 function preventContextMenu(event: MouseEvent) {
@@ -2716,6 +3288,14 @@ onUnmounted(() => {
           @click="switchTab('history')"
         >
           <Clock :size="17" />历史记录
+        </button>
+        <button
+          class="main-tab"
+          :class="{ active: activeTab === 'requests' }"
+          type="button"
+          @click="switchTab('requests')"
+        >
+          <Connection :size="17" />请求记录
         </button>
         <button
           class="main-tab"
@@ -2794,7 +3374,10 @@ onUnmounted(() => {
                 size="small"
                 plain
                 :icon="Iphone"
-                :disabled="draft.expenses.length >= MAX_EXPENSES"
+                :disabled="
+                  draft.expenses.length >= MAX_EXPENSES ||
+                  previewAttachments.length >= MAX_TOTAL_ATTACHMENTS
+                "
                 @click.stop="openLanUpload"
                 >手机上传</el-button
               >
@@ -2959,6 +3542,79 @@ onUnmounted(() => {
                   "
                 />
               </div>
+              <div class="expense-extra-section" @click.stop>
+                <div class="expense-extra-heading">
+                  <span
+                    >附加图片
+                    <small
+                      >{{ expense.extraAttachments.length }} 张</small
+                    ></span
+                  >
+                  <el-button
+                    size="small"
+                    plain
+                    :icon="Plus"
+                    :disabled="!extraAttachmentSlots(expense)"
+                    @click="openExtraUpload(expense)"
+                    >添加附图</el-button
+                  >
+                </div>
+                <div
+                  v-if="expense.extraAttachments.length"
+                  class="expense-extra-list"
+                >
+                  <div
+                    v-for="(
+                      attachment, attachmentIndex
+                    ) in expense.extraAttachments"
+                    :key="attachment.id"
+                    class="expense-extra-item"
+                  >
+                    <el-image
+                      :src="attachment.imageDataUrl"
+                      :alt="attachment.fileName"
+                      fit="cover"
+                      :preview-src-list="
+                        expense.extraAttachments.map(
+                          (item) => item.imageDataUrl,
+                        )
+                      "
+                      :initial-index="attachmentIndex"
+                      preview-teleported
+                      hide-on-click-modal
+                    />
+                    <div class="expense-extra-actions">
+                      <el-button
+                        circle
+                        text
+                        :icon="ArrowLeftBold"
+                        title="向前移动"
+                        :disabled="attachmentIndex === 0"
+                        @click="moveExtraAttachment(expense, attachment, -1)"
+                      />
+                      <el-button
+                        circle
+                        text
+                        :icon="ArrowRightBold"
+                        title="向后移动"
+                        :disabled="
+                          attachmentIndex ===
+                          expense.extraAttachments.length - 1
+                        "
+                        @click="moveExtraAttachment(expense, attachment, 1)"
+                      />
+                      <el-button
+                        circle
+                        text
+                        type="danger"
+                        :icon="Delete"
+                        title="删除附加图片"
+                        @click="removeExtraAttachment(expense, attachment)"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
             </article>
           </div>
         </section>
@@ -2967,9 +3623,7 @@ onUnmounted(() => {
         <div class="preview-toolbar">
           <div>
             <span class="eyebrow">STEP 03</span>
-            <h1>
-              {{ draft.previewMode === "double" ? "两页" : "一页" }} A4 预览
-            </h1>
+            <h1>{{ previewPageCount }} 页 A4 预览</h1>
           </div>
           <div class="preview-toolbar-right">
             <div class="preview-context-selects">
@@ -3013,8 +3667,8 @@ onUnmounted(() => {
             <el-segmented
               v-model="draft.previewMode"
               :options="[
-                { label: '一页', value: 'single' },
-                { label: '两页', value: 'double' },
+                { label: '附件同页', value: 'single' },
+                { label: '附件分页', value: 'double' },
               ]"
               @change="dirty"
             />
@@ -3040,27 +3694,28 @@ onUnmounted(() => {
               text
               :icon="Refresh"
               title="重置当前图片排版"
-              :disabled="!selectedExpense"
+              :disabled="!selectedAttachment"
               @click="resetImage"
             />
           </div>
         </div>
         <div class="paper-stage" :style="paperSize">
-          <div
-            class="paper-scale"
-            :class="{ 'double-page-scale': draft.previewMode === 'double' }"
-          >
-            <div
-              class="preview-pages"
-              :class="{ 'double-page': draft.previewMode === 'double' }"
-            >
-              <div class="paper form-paper" data-export-page="form">
+          <div class="paper-scale">
+            <div class="preview-pages">
+              <div
+                v-for="(formPage, formPageIndex) in formPages"
+                :key="'form-' + formPageIndex"
+                class="paper form-paper"
+                data-export-page="form"
+              >
                 <div class="paper-title">
                   <div class="paper-title-text">
-                    {{ draft.companyName }}费用报销单
+                    {{ draft.companyName }}费用报销单{{
+                      formPage.isFirst ? "" : "（续）"
+                    }}
                   </div>
                 </div>
-                <div class="paper-meta">
+                <div v-if="formPage.isFirst" class="paper-meta">
                   <div class="meta-cell">
                     <span>报销日期：</span>
                   </div>
@@ -3119,11 +3774,12 @@ onUnmounted(() => {
                       </tr>
                     </thead>
                     <tbody>
-                      <template v-if="draft.expenses.length"
+                      <template v-if="formPage.rows.length"
                         ><tr
-                          v-for="(expense, index) in draft.expenses"
+                          v-for="{ expense, index, height } in formPage.rows"
                           :key="expense.id"
                           :data-expense-id="expense.id"
+                          :style="{ height: height + 'px' }"
                           :class="{
                             'selected-row': expense.id === selectedId,
                             'dragging-row':
@@ -3210,6 +3866,7 @@ onUnmounted(() => {
                                 ref="editInput"
                                 v-model="editValue"
                                 class="paper-cell-input description-input"
+                                :style="{ height: height - 8 + 'px' }"
                                 rows="2"
                                 @blur="commitExpense(expense, 'description')"
                               /></template
@@ -3248,7 +3905,7 @@ onUnmounted(() => {
                               </select></template
                             ><button
                               v-else
-                              class="paper-editable"
+                              class="paper-editable arranger-button"
                               type="button"
                               @click.stop="
                                 beginEdit(
@@ -3303,184 +3960,130 @@ onUnmounted(() => {
                     </tbody>
                   </table>
                 </div>
-                <div class="paper-total-block">
-                  <div class="total-label">合计金额</div>
-                  <div class="total-value">
-                    <button
-                      v-if="!manualTotal"
-                      class="paper-editable total-number"
-                      type="button"
+                <template v-if="formPage.isLast">
+                  <div class="paper-total-block">
+                    <div class="total-label">合计金额</div>
+                    <div class="total-value">
+                      <button
+                        v-if="!manualTotal"
+                        class="paper-editable total-number"
+                        type="button"
+                        @click="
+                          draft.totalOverrideCents = effectiveTotal;
+                          dirty();
+                        "
+                      >
+                        ￥{{ money(effectiveTotal) }}</button
+                      ><input
+                        v-else
+                        class="paper-edit-input total-number"
+                        :value="(effectiveTotal / 100).toFixed(2)"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        @change="
+                          (event) => {
+                            const amount = Number(
+                              (event.target as HTMLInputElement).value,
+                            );
+                            draft.totalOverrideCents = Number.isFinite(amount)
+                              ? Math.max(0, Math.round(amount * 100))
+                              : 0;
+                            dirty();
+                          }
+                        "
+                      />
+                    </div>
+                    <div class="uppercase-value">
+                      {{ ChineseAmount(effectiveTotal) }}
+                    </div>
+                  </div>
+                  <div v-if="manualTotal" class="manual-total-action">
+                    <el-button
+                      text
+                      size="small"
                       @click="
-                        draft.totalOverrideCents = effectiveTotal;
+                        draft.totalOverrideCents = null;
                         dirty();
                       "
+                      >恢复自动合计</el-button
                     >
-                      ￥{{ money(effectiveTotal) }}</button
-                    ><input
-                      v-else
-                      class="paper-edit-input total-number"
-                      :value="(effectiveTotal / 100).toFixed(2)"
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      @change="
-                        (event) => {
-                          const amount = Number(
-                            (event.target as HTMLInputElement).value,
-                          );
-                          draft.totalOverrideCents = Number.isFinite(amount)
-                            ? Math.max(0, Math.round(amount * 100))
-                            : 0;
-                          dirty();
-                        }
-                      "
-                    />
                   </div>
-                  <div class="uppercase-value">
-                    {{ ChineseAmount(effectiveTotal) }}
-                  </div>
-                </div>
-                <div v-if="manualTotal" class="manual-total-action">
-                  <el-button
-                    text
-                    size="small"
-                    @click="
-                      draft.totalOverrideCents = null;
-                      dirty();
-                    "
-                    >恢复自动合计</el-button
-                  >
-                </div>
-                <div class="paper-payment">
-                  <span>收款信息：</span>
-                  <div class="payment-content">
-                    <div>
-                      <b>名称：</b
-                      ><button
-                        class="paper-editable"
-                        type="button"
-                        @click="beginEdit('payeeName', draft.payeeName)"
-                      >
-                        {{ draft.payeeName || "xxxx" }}
-                      </button>
-                    </div>
-                    <div>
-                      <b>账号：</b
-                      ><button
-                        class="paper-editable"
-                        type="button"
-                        @click="beginEdit('account', draft.account)"
-                      >
-                        {{ draft.account || "xxxxx" }}
-                      </button>
-                    </div>
-                    <div>
-                      <b>开户行：</b
-                      ><button
-                        class="paper-editable"
-                        type="button"
-                        @click="beginEdit('bank', draft.bank)"
-                      >
-                        {{ draft.bank || "xxxxx" }}
-                      </button>
+                  <div class="paper-payment">
+                    <span>收款信息：</span>
+                    <div class="payment-content">
+                      <div>
+                        <b>名称：</b
+                        ><button
+                          class="paper-editable"
+                          type="button"
+                          @click="beginEdit('payeeName', draft.payeeName)"
+                        >
+                          {{ draft.payeeName || "xxxx" }}
+                        </button>
+                      </div>
+                      <div>
+                        <b>账号：</b
+                        ><button
+                          class="paper-editable"
+                          type="button"
+                          @click="beginEdit('account', draft.account)"
+                        >
+                          {{ draft.account || "xxxxx" }}
+                        </button>
+                      </div>
+                      <div>
+                        <b>开户行：</b
+                        ><button
+                          class="paper-editable"
+                          type="button"
+                          @click="beginEdit('bank', draft.bank)"
+                        >
+                          {{ draft.bank || "xxxxx" }}
+                        </button>
+                      </div>
                     </div>
                   </div>
-                </div>
-                <div class="paper-approval">
-                  <span>部门负责人：</span><span>财务：</span
-                  ><span>总经理审核：</span>
-                </div>
-                <div
-                  v-if="draft.previewMode === 'single'"
-                  class="attachment-area active-attachment-area"
-                >
-                  <div v-if="!draft.expenses.length" class="attachment-empty">
-                    图片会按费用顺序排列在这里
+                  <div class="paper-approval">
+                    <span>部门负责人：</span><span>财务：</span
+                    ><span>总经理审核：</span>
                   </div>
-                  <div
-                    v-for="expense in draft.expenses"
-                    :key="expense.id"
-                    class="attachment-object"
-                    :class="{ selected: expense.id === selectedId }"
-                    :style="{
-                      left: `${expense.transform.x}%`,
-                      top: `${expense.transform.y}%`,
-                      width: `${expense.transform.width}%`,
-                      height: `${expense.transform.height}%`,
-                      transform: `rotate(${expense.transform.rotation}deg)`,
-                    }"
-                    @pointerdown="pointerStart($event, expense, 'move')"
-                    @click.stop="selectExpense(expense)"
-                  >
-                    <img
-                      :src="expense.imageDataUrl"
-                      :alt="expense.fileName"
-                      :style="{
-                        transform: `scale(${expense.transform.cropZoom})`,
-                        objectPosition: `${expense.transform.cropX}% ${expense.transform.cropY}%`,
-                      }"
-                    /><span class="attachment-label">{{
-                      draft.expenses.indexOf(expense) + 1
-                    }}</span
-                    ><span
-                      v-if="expense.id === selectedId"
-                      class="resize-handle"
-                      @pointerdown="pointerStart($event, expense, 'resize')"
-                    />
-                  </div>
-                </div>
+                </template>
+                <AttachmentSurface
+                  v-if="formPage.isLast && sharedAttachmentPage"
+                  :attachments="sharedAttachmentPage"
+                  :page-index="0"
+                  :selected-id="selectedAttachmentId"
+                  @select="selectAttachment"
+                  @pointer-start="pointerStart"
+                />
               </div>
               <div
-                v-if="draft.previewMode === 'double'"
+                v-for="(
+                  attachments, attachmentPageIndex
+                ) in separateAttachmentPages"
+                :key="'attachment-' + attachmentPageIndex"
                 class="paper attachment-paper"
                 data-export-page="attachments"
               >
-                <div class="attachment-area active-attachment-area">
-                  <div v-if="!draft.expenses.length" class="attachment-empty">
-                    图片会按费用顺序排列在这里
-                  </div>
-                  <div
-                    v-for="expense in draft.expenses"
-                    :key="expense.id"
-                    class="attachment-object"
-                    :class="{ selected: expense.id === selectedId }"
-                    :style="{
-                      left: `${expense.transform.x}%`,
-                      top: `${expense.transform.y}%`,
-                      width: `${expense.transform.width}%`,
-                      height: `${expense.transform.height}%`,
-                      transform: `rotate(${expense.transform.rotation}deg)`,
-                    }"
-                    @pointerdown="pointerStart($event, expense, 'move')"
-                    @click.stop="selectExpense(expense)"
-                  >
-                    <img
-                      :src="expense.imageDataUrl"
-                      :alt="expense.fileName"
-                      :style="{
-                        transform: `scale(${expense.transform.cropZoom})`,
-                        objectPosition: `${expense.transform.cropX}% ${expense.transform.cropY}%`,
-                      }"
-                    />
-                    <span class="attachment-label">{{
-                      draft.expenses.indexOf(expense) + 1
-                    }}</span>
-                    <span
-                      v-if="expense.id === selectedId"
-                      class="resize-handle"
-                      @pointerdown="pointerStart($event, expense, 'resize')"
-                    />
-                  </div>
-                </div>
+                <AttachmentSurface
+                  :attachments="attachments"
+                  :page-index="
+                    (sharedAttachmentPage ? 1 : 0) + attachmentPageIndex
+                  "
+                  :selected-id="selectedAttachmentId"
+                  @select="selectAttachment"
+                  @pointer-start="pointerStart"
+                />
               </div>
             </div>
           </div>
         </div>
-        <div v-if="selectedExpense" class="image-inspector">
+        <div v-if="selectedAttachment" class="image-inspector">
           <div class="inspector-title">
             <div>
               <span class="eyebrow">SELECTED IMAGE</span
-              ><strong>{{ selectedExpense.fileName }}</strong>
+              ><strong>{{ selectedAttachment.fileName }}</strong>
             </div>
             <div class="inspector-actions">
               <el-button
@@ -3500,40 +4103,42 @@ onUnmounted(() => {
                 text
                 type="danger"
                 :icon="Delete"
-                title="删除这笔费用"
-                @click="removeExpense(selectedExpense)"
+                :title="
+                  selectedAttachment.isPrimary ? '删除这笔费用' : '删除附加图片'
+                "
+                @click="removeSelectedAttachment"
               />
             </div>
           </div>
           <label
             >裁剪缩放<input
-              v-model.number="selectedExpense.transform.cropZoom"
+              v-model.number="selectedAttachment.transform.cropZoom"
               type="range"
               min="1"
               max="2.4"
               step="0.05"
               @input="dirty"
             /><output
-              >{{ selectedExpense.transform.cropZoom.toFixed(2) }}x</output
+              >{{ selectedAttachment.transform.cropZoom.toFixed(2) }}x</output
             ></label
           ><label
             >横向取景<input
-              v-model.number="selectedExpense.transform.cropX"
+              v-model.number="selectedAttachment.transform.cropX"
               type="range"
               min="0"
               max="100"
               step="1"
               @input="dirty"
-            /><output>{{ selectedExpense.transform.cropX }}%</output></label
+            /><output>{{ selectedAttachment.transform.cropX }}%</output></label
           ><label
             >纵向取景<input
-              v-model.number="selectedExpense.transform.cropY"
+              v-model.number="selectedAttachment.transform.cropY"
               type="range"
               min="0"
               max="100"
               step="1"
               @input="dirty"
-            /><output>{{ selectedExpense.transform.cropY }}%</output></label
+            /><output>{{ selectedAttachment.transform.cropY }}%</output></label
           >
         </div>
       </section>
@@ -3615,6 +4220,130 @@ onUnmounted(() => {
       >
     </el-dialog>
     <el-dialog
+      v-model="isExtraUploadOpen"
+      :title="
+        extraUploadExpense
+          ? '添加附图 · 费用 ' +
+            (draft.expenses.indexOf(extraUploadExpense) + 1)
+          : '添加附图'
+      "
+      width="680px"
+      destroy-on-close
+      @closed="extraUploadExpenseId = null"
+    >
+      <template v-if="extraUploadExpense">
+        <section
+          ref="extraUploadZone"
+          class="upload-panel extra-upload-panel"
+          tabindex="0"
+          @focus="extraUploadFocused = true"
+          @blur="extraUploadFocused = false"
+          @paste="extraPasted"
+          @dragover.prevent="extraUploadFocused = true"
+          @drop.prevent="extraDropped"
+        >
+          <input
+            ref="extraFileInput"
+            class="hidden-file"
+            type="file"
+            accept="image/*"
+            multiple
+            @change="extraFilesChanged"
+          />
+          <div class="upload-panel-header">
+            <div>
+              <span class="eyebrow">EXTRA ATTACHMENTS</span>
+              <h2>添加附加图片</h2>
+            </div>
+            <div class="upload-panel-actions">
+              <el-button
+                size="small"
+                plain
+                :icon="Iphone"
+                :disabled="!extraAttachmentSlots(extraUploadExpense)"
+                @click.stop="openLanUpload(extraUploadExpense)"
+                >手机上传</el-button
+              >
+              <el-tag effect="plain" type="info"
+                >本笔 {{ extraUploadExpense.extraAttachments.length + 1 }}/{{
+                  MAX_ATTACHMENTS_PER_EXPENSE
+                }}</el-tag
+              >
+            </div>
+          </div>
+          <button
+            class="upload-dropzone"
+            type="button"
+            :disabled="!extraAttachmentSlots(extraUploadExpense)"
+            @click="openExtraPicker"
+          >
+            <span class="upload-icon"><Upload :size="22" /></span
+            ><strong>点击选择或拖入附加图片</strong
+            ><span>选中上传框后可直接 Ctrl+V 粘贴截图，不执行智能识别</span>
+          </button>
+        </section>
+        <div
+          v-if="extraUploadExpense.extraAttachments.length"
+          class="extra-dialog-list"
+        >
+          <div
+            v-for="(
+              attachment, attachmentIndex
+            ) in extraUploadExpense.extraAttachments"
+            :key="attachment.id"
+            class="extra-dialog-item"
+          >
+            <el-image
+              :src="attachment.imageDataUrl"
+              :alt="attachment.fileName"
+              fit="cover"
+              :preview-src-list="
+                extraUploadExpense.extraAttachments.map(
+                  (item) => item.imageDataUrl,
+                )
+              "
+              :initial-index="attachmentIndex"
+              preview-teleported
+              hide-on-click-modal
+            />
+            <span :title="attachment.fileName">{{ attachment.fileName }}</span>
+            <div>
+              <el-button
+                circle
+                text
+                :icon="ArrowLeftBold"
+                title="向前移动"
+                :disabled="attachmentIndex === 0"
+                @click="moveExtraAttachment(extraUploadExpense, attachment, -1)"
+              />
+              <el-button
+                circle
+                text
+                :icon="ArrowRightBold"
+                title="向后移动"
+                :disabled="
+                  attachmentIndex ===
+                  extraUploadExpense.extraAttachments.length - 1
+                "
+                @click="moveExtraAttachment(extraUploadExpense, attachment, 1)"
+              />
+              <el-button
+                circle
+                text
+                type="danger"
+                :icon="Delete"
+                title="删除附加图片"
+                @click="removeExtraAttachment(extraUploadExpense, attachment)"
+              />
+            </div>
+          </div>
+        </div>
+      </template>
+      <template #footer>
+        <el-button @click="isExtraUploadOpen = false">完成</el-button>
+      </template>
+    </el-dialog>
+    <el-dialog
       v-model="isLanUploadOpen"
       title="手机扫码上传"
       width="520px"
@@ -3687,7 +4416,7 @@ onUnmounted(() => {
           type="primary"
           :icon="Refresh"
           :loading="isLanUploadLoading"
-          :disabled="draft.expenses.length >= MAX_EXPENSES"
+          :disabled="!lanUploadRemainingSlots()"
           @click="refreshLanUploadSession"
           >刷新二维码</el-button
         >
@@ -3874,6 +4603,13 @@ onUnmounted(() => {
                   placeholder="API Key"
                   @change="dirty"
                 />
+                <label class="service-switch service-wide">
+                  <span>
+                    <strong>是否多模态</strong>
+                    <small>开启后会把识别图片与 OCR 文本一并发送给模型</small>
+                  </span>
+                  <el-switch v-model="profile.multimodal" @change="dirty" />
+                </label>
               </div>
             </article>
           </div>
@@ -4108,6 +4844,162 @@ onUnmounted(() => {
         />
       </div>
     </section>
+    <section v-if="activeTab === 'requests'" class="page-shell requests-page">
+      <div class="page-heading">
+        <div>
+          <span class="eyebrow">DIAGNOSTICS</span>
+          <h1>请求记录</h1>
+        </div>
+        <div class="request-page-actions">
+          <el-button
+            plain
+            :icon="Refresh"
+            :loading="isRequestLoading"
+            @click="loadRequestLogs"
+            >刷新</el-button
+          >
+          <el-button
+            plain
+            type="danger"
+            :icon="Delete"
+            :disabled="!requestRecords.length"
+            @click="clearRequestLogs"
+            >清空记录</el-button
+          >
+        </div>
+      </div>
+      <div class="request-toolbar">
+        <el-input
+          v-model="requestSearch"
+          clearable
+          placeholder="搜索文件、配置、模型、地址或错误"
+        />
+        <el-select v-model="requestService" clearable placeholder="全部服务">
+          <el-option label="OCR" value="ocr" />
+          <el-option label="大模型" value="llm" />
+        </el-select>
+        <el-select v-model="requestStatus" clearable placeholder="全部状态">
+          <el-option label="成功" value="success" />
+          <el-option label="失败" value="error" />
+        </el-select>
+      </div>
+      <div v-loading="isRequestLoading">
+        <div v-if="!filteredRequests.length" class="history-empty">
+          <Connection :size="25" />
+          <strong>还没有请求记录</strong>
+          <span>执行 OCR 或大模型识别后，会在本机保存脱敏记录</span>
+        </div>
+        <div v-else class="request-list">
+          <article
+            v-for="item in pagedRequests"
+            :key="item.id"
+            class="request-item"
+            @click="openRequestDetail(item)"
+          >
+            <div class="request-item-status">
+              <el-tag
+                effect="plain"
+                :type="item.service === 'ocr' ? 'warning' : 'primary'"
+                >{{ requestServiceLabel(item.service) }}</el-tag
+              >
+              <el-tag
+                effect="dark"
+                :type="item.success ? 'success' : 'danger'"
+                >{{ item.success ? "成功" : "失败" }}</el-tag
+              >
+            </div>
+            <div class="request-item-main">
+              <strong>{{ item.fileName || "未命名费用图片" }}</strong>
+              <span :title="item.requestUrl">{{ item.requestUrl }}</span>
+              <small>
+                {{ item.profileName }}
+                <template v-if="item.model"> · {{ item.model }}</template>
+                <template v-if="item.action"> · {{ item.action }}</template>
+              </small>
+            </div>
+            <div class="request-item-meta">
+              <span>{{ formatRequestTime(item.requestedAt) }}</span>
+              <span>{{ item.durationMs }} ms</span>
+              <span v-if="item.httpStatus">HTTP {{ item.httpStatus }}</span>
+            </div>
+            <el-button
+              circle
+              text
+              :icon="View"
+              title="查看请求详情"
+              @click.stop="openRequestDetail(item)"
+            />
+          </article>
+        </div>
+      </div>
+      <div v-if="filteredRequests.length" class="history-pagination">
+        <el-pagination
+          v-model:current-page="requestPage"
+          v-model:page-size="requestPageSize"
+          background
+          layout="total, prev, pager, next"
+          :total="filteredRequests.length"
+        />
+      </div>
+    </section>
+    <el-dialog
+      v-model="isRequestDetailOpen"
+      title="请求详情"
+      width="900px"
+      destroy-on-close
+    >
+      <div v-loading="isRequestDetailLoading" class="request-detail">
+        <template v-if="requestDetail">
+          <el-descriptions :column="2" border>
+            <el-descriptions-item label="服务">
+              {{ requestServiceLabel(requestDetail.service) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="状态">
+              <el-tag :type="requestDetail.success ? 'success' : 'danger'">
+                {{ requestDetail.success ? "成功" : "失败" }}
+              </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="请求时间">
+              {{ formatRequestTime(requestDetail.requestedAt) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="耗时">
+              {{ requestDetail.durationMs }} ms
+            </el-descriptions-item>
+            <el-descriptions-item label="配置">
+              {{ requestDetail.profileName }}
+            </el-descriptions-item>
+            <el-descriptions-item label="模型 / Action">
+              {{ requestDetail.model || requestDetail.action || "-" }}
+            </el-descriptions-item>
+            <el-descriptions-item label="关联图片">
+              {{ requestDetail.fileName || "-" }}
+            </el-descriptions-item>
+            <el-descriptions-item label="HTTP 状态">
+              {{ requestDetail.httpStatus || "-" }}
+            </el-descriptions-item>
+            <el-descriptions-item label="请求地址" :span="2">
+              <span class="request-detail-url">{{
+                requestDetail.requestUrl
+              }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item
+              v-if="requestDetail.error"
+              label="错误信息"
+              :span="2"
+            >
+              {{ requestDetail.error }}
+            </el-descriptions-item>
+          </el-descriptions>
+          <h4>请求内容（密钥与图片数据已脱敏）</h4>
+          <pre>{{ requestDetail.requestContent }}</pre>
+          <h4>响应内容</h4>
+          <pre>{{ requestDetail.responseContent || "未取得响应内容" }}</pre>
+        </template>
+      </div>
+      <template #footer>
+        <el-button @click="isRequestDetailOpen = false">关闭</el-button>
+      </template>
+    </el-dialog>
     <section v-if="activeTab === 'settings'" class="page-shell profiles-page">
       <div class="profile-drawer-head">
         <div>
@@ -4169,7 +5061,7 @@ onUnmounted(() => {
         <h1>SheepFinance</h1>
         <p>将票据截图识别、核对并排版为报销单的本地桌面工具。</p>
         <div class="about-meta">
-          <span>版本 0.1.6</span><span>Windows 10 x64</span>
+          <span>版本 0.1.8</span><span>Windows 10 x64</span>
         </div>
         <div class="about-links">
           <el-link
@@ -4908,8 +5800,10 @@ h3 {
   width: 100%;
   height: 100%;
   display: block;
-  object-fit: contain;
-  transition: transform 0.12s;
+  object-fit: cover;
+  transition:
+    transform 0.12s,
+    object-position 0.12s;
   user-select: none;
   pointer-events: none;
 }
@@ -5823,7 +6717,7 @@ h3 {
 }
 .reimbursement-active .paper-scale {
   width: var(--scaled-paper-width);
-  height: var(--scaled-paper-height);
+  height: var(--scaled-preview-height);
   margin: 0 auto;
   transform: none !important;
 }
@@ -6195,9 +7089,6 @@ h3 {
   transform: scale(var(--paper-scale));
   transform-origin: top left;
 }
-.reimbursement-active .paper-scale.double-page-scale {
-  height: calc(var(--scaled-paper-height) * 2 + 28px * var(--paper-scale));
-}
 .reimbursement-active .paper {
   transform: none;
 }
@@ -6372,6 +7263,267 @@ h3 {
   display: flex;
   justify-content: flex-end;
   margin-top: 16px;
+}
+.paper-table tbody tr {
+  height: 42px;
+}
+.paper-table tbody td,
+.description-cell {
+  height: auto;
+}
+.description-button,
+.arranger-button {
+  display: block;
+  width: 100%;
+  overflow: visible;
+  line-height: 1.3;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-line-clamp: unset;
+  -webkit-box-orient: initial;
+}
+.description-input {
+  min-height: 34px;
+  overflow: hidden;
+}
+.expense-extra-section {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid #e4eae6;
+}
+.expense-extra-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.expense-extra-heading > span {
+  color: #53675e;
+  font-size: 12px;
+  font-weight: 700;
+}
+.expense-extra-heading small {
+  margin-left: 5px;
+  color: #8b9991;
+  font-size: 10px;
+  font-weight: 400;
+}
+.expense-extra-list {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 8px;
+}
+.expense-extra-item {
+  min-width: 0;
+  position: relative;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: 1px solid #d8e1dc;
+  border-radius: 6px;
+  background: #eef2ef;
+}
+.expense-extra-item .el-image {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.expense-extra-actions {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  left: 2px;
+  display: flex;
+  justify-content: center;
+  padding: 2px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.9);
+}
+.expense-extra-actions .el-button {
+  width: 22px;
+  height: 22px;
+  margin: 0 !important;
+}
+.extra-upload-panel {
+  margin: 0;
+}
+.upload-dropzone:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.extra-dialog-list {
+  max-height: 300px;
+  display: grid;
+  gap: 7px;
+  margin-top: 14px;
+  overflow: auto;
+}
+.extra-dialog-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px;
+  border: 1px solid #dce4df;
+  border-radius: 7px;
+}
+.extra-dialog-item .el-image {
+  width: 52px;
+  height: 52px;
+  border-radius: 5px;
+}
+.extra-dialog-item > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.extra-dialog-item > div {
+  display: flex;
+}
+.extra-dialog-item .el-button {
+  margin: 0 !important;
+}
+.service-switch {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 7px 10px;
+  border: 1px solid #d8e1dc;
+  border-radius: 6px;
+  background: #fbfcfb;
+}
+.service-switch span,
+.service-switch strong,
+.service-switch small {
+  display: block;
+}
+.service-switch strong {
+  color: #465c52;
+  font-size: 12px;
+}
+.service-switch small {
+  margin-top: 2px;
+  color: #8a9991;
+  font-size: 10px;
+}
+.requests-page {
+  padding-left: max(42px, calc((100% - 1100px) / 2));
+  padding-right: max(42px, calc((100% - 1100px) / 2));
+}
+.request-page-actions,
+.request-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.request-toolbar {
+  padding: 14px;
+  border: 1px solid #dce4df;
+  border-radius: 8px;
+  background: #fff;
+}
+.request-toolbar .el-input {
+  flex: 1;
+}
+.request-toolbar .el-select {
+  width: 150px;
+  flex: 0 0 150px;
+}
+.request-list {
+  display: grid;
+  gap: 9px;
+  margin-top: 14px;
+}
+.request-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 126px minmax(0, 1fr) 170px 34px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid #dce4df;
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.request-item:hover {
+  border-color: #d39a89;
+  box-shadow: 0 6px 14px rgba(81, 66, 60, 0.08);
+}
+.request-item-status {
+  display: flex;
+  gap: 6px;
+}
+.request-item-main,
+.request-item-main strong,
+.request-item-main span,
+.request-item-main small {
+  min-width: 0;
+  display: block;
+}
+.request-item-main span,
+.request-item-main small {
+  margin-top: 3px;
+  overflow: hidden;
+  color: #7a8981;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.request-item-main span {
+  font-size: 11px;
+}
+.request-item-main small {
+  font-size: 10px;
+}
+.request-item-meta {
+  display: grid;
+  gap: 3px;
+  color: #708078;
+  text-align: right;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.request-detail {
+  min-height: 180px;
+}
+.request-detail h4 {
+  margin: 16px 0 7px;
+}
+.request-detail pre {
+  max-height: 280px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid #dce4df;
+  border-radius: 6px;
+  color: #32453c;
+  background: #f7f9f7;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.request-detail-url {
+  overflow-wrap: anywhere;
+}
+@media (max-width: 1080px) {
+  .requests-page {
+    padding-right: 24px;
+    padding-left: 24px;
+  }
+  .request-item {
+    grid-template-columns: 116px minmax(0, 1fr) 34px;
+  }
+  .request-item-meta {
+    display: none;
+  }
 }
 .exporting-document .attachment-object,
 .exporting-document .attachment-object.selected,

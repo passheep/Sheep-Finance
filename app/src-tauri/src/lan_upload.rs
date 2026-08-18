@@ -29,6 +29,7 @@ const DEFAULT_TTL_SECONDS: u64 = 15 * 60;
 #[derive(Clone)]
 struct UploadSession {
     record_id: String,
+    target_expense_id: Option<String>,
     label: String,
     token: String,
     expires_at: u64,
@@ -66,6 +67,8 @@ impl Default for LanUploadManager {
 #[serde(rename_all = "camelCase")]
 pub struct StartLanUploadRequest {
     record_id: String,
+    #[serde(default)]
+    target_expense_id: Option<String>,
     label: String,
     remaining_slots: usize,
     #[serde(default = "default_ttl_seconds")]
@@ -76,6 +79,8 @@ pub struct StartLanUploadRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateLanUploadRequest {
     record_id: String,
+    #[serde(default)]
+    target_expense_id: Option<String>,
     label: String,
     remaining_slots: usize,
 }
@@ -85,6 +90,7 @@ pub struct UpdateLanUploadRequest {
 pub struct LanUploadSessionInfo {
     url: String,
     record_id: String,
+    target_expense_id: Option<String>,
     label: String,
     expires_at: u64,
     remaining_slots: usize,
@@ -95,6 +101,7 @@ pub struct LanUploadSessionInfo {
 #[serde(rename_all = "camelCase")]
 struct LanUploadEvent {
     record_id: String,
+    target_expense_id: Option<String>,
     remaining_slots: usize,
     file: LanUploadFile,
 }
@@ -124,6 +131,7 @@ pub async fn start_lan_upload_session(
 ) -> Result<LanUploadSessionInfo, String> {
     let _operation = manager.operation.lock().await;
     validate_record_id(&request.record_id)?;
+    validate_target_expense_id(request.target_expense_id.as_deref())?;
     if request.remaining_slots == 0 {
         return Err("当前报销单已达到 10 张图片上限".to_string());
     }
@@ -131,6 +139,7 @@ pub async fn start_lan_upload_session(
     let address = ensure_server(&app, &manager).await?;
     let session = UploadSession {
         record_id: request.record_id,
+        target_expense_id: request.target_expense_id,
         label: clean_label(&request.label),
         token: Uuid::new_v4().simple().to_string(),
         expires_at: now_millis()
@@ -147,6 +156,8 @@ pub async fn update_lan_upload_session(
     request: UpdateLanUploadRequest,
 ) -> Result<(), String> {
     let _operation = manager.operation.lock().await;
+    validate_record_id(&request.record_id)?;
+    validate_target_expense_id(request.target_expense_id.as_deref())?;
     let mut current = manager.session.write().await;
     let Some(session) = current.as_mut() else {
         return Ok(());
@@ -155,6 +166,7 @@ pub async fn update_lan_upload_session(
         *current = None;
         return Ok(());
     }
+    session.target_expense_id = request.target_expense_id;
     session.label = clean_label(&request.label);
     session.remaining_slots = request.remaining_slots.min(MAX_FILES);
     Ok(())
@@ -295,7 +307,7 @@ async fn upload_files(
     }
 
     let requested_count = files.len();
-    let remaining_slots = {
+    let (remaining_slots, target_expense_id) = {
         let mut current = state.session.write().await;
         let Some(current_session) = current.as_mut() else {
             return json_error(StatusCode::GONE, "上传会话已关闭");
@@ -313,7 +325,10 @@ async fn upload_files(
             );
         }
         current_session.remaining_slots -= files.len();
-        current_session.remaining_slots
+        (
+            current_session.remaining_slots,
+            current_session.target_expense_id.clone(),
+        )
     };
 
     let mut accepted_count = 0;
@@ -324,6 +339,7 @@ async fn upload_files(
                 "lan-upload-received",
                 LanUploadEvent {
                     record_id: record_id.clone(),
+                    target_expense_id: target_expense_id.clone(),
                     remaining_slots,
                     file,
                 },
@@ -388,6 +404,7 @@ fn session_info(session: &UploadSession, address: SocketAddr) -> LanUploadSessio
             address, session.record_id, session.token
         ),
         record_id: session.record_id.clone(),
+        target_expense_id: session.target_expense_id.clone(),
         label: session.label.clone(),
         expires_at: session.expires_at,
         remaining_slots: session.remaining_slots,
@@ -457,6 +474,21 @@ fn validate_record_id(record_id: &str) -> Result<(), String> {
             .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
     {
         return Err("报销单编号格式无效".to_string());
+    }
+    Ok(())
+}
+
+fn validate_target_expense_id(expense_id: Option<&str>) -> Result<(), String> {
+    let Some(expense_id) = expense_id else {
+        return Ok(());
+    };
+    if expense_id.is_empty()
+        || expense_id.len() > 120
+        || !expense_id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+    {
+        return Err("费用编号格式无效".to_string());
     }
     Ok(())
 }
@@ -589,6 +621,7 @@ mod tests {
     fn mobile_page_contains_current_session_only() {
         let session = UploadSession {
             record_id: "record-12345678".to_string(),
+            target_expense_id: Some("expense-1".to_string()),
             label: "办公费<script>".to_string(),
             token: "secret".to_string(),
             expires_at: 123,
@@ -608,6 +641,7 @@ mod tests {
             .block_on(async {
                 let state = Arc::new(RwLock::new(Some(UploadSession {
                     record_id: "record-token-test".to_string(),
+                    target_expense_id: None,
                     label: "办公费".to_string(),
                     token: "old-token".to_string(),
                     expires_at: now_millis() + 60_000,
@@ -619,6 +653,7 @@ mod tests {
 
                 *state.write().await = Some(UploadSession {
                     record_id: "record-token-test".to_string(),
+                    target_expense_id: None,
                     label: "办公费".to_string(),
                     token: "new-token".to_string(),
                     expires_at: now_millis() + 60_000,

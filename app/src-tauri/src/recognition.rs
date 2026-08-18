@@ -6,8 +6,11 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tauri::AppHandle;
 use time::{macros::format_description, OffsetDateTime};
 use uuid::Uuid;
+
+use crate::request_log::{append_request_log, now_iso8601, RequestLogInput};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -15,7 +18,7 @@ const ALIYUN_API_VERSION: &str = "2021-07-07";
 const ADVANCED_OCR_QUERY: &str = "NeedRotate=true&NeedSortPage=true&Paragraph=true&Row=true";
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const EXTRACTION_SYSTEM_PROMPT: &str = concat!(
-    "你是严格的中文报销单据字段提取器。只根据 OCR 原文提取，不得编造。",
+    "你是严格的中文报销单据字段提取器。只根据 OCR 原文和可选的原始票据图片提取，不得编造；图片仅用于核对 OCR 结果。",
     "不要输出分析、思考过程或 reasoning_content。无论信息是否完整，都必须返回且只能返回一个合法 JSON 对象，禁止 Markdown、解释、前后缀和空响应。",
     "JSON 必须包含 occurredDate、reasonName、description、amount、confidence、evidence 六个键；",
     "无法确定的标量填 null，confidence 和 evidence 无内容时填空对象。",
@@ -30,6 +33,12 @@ const EXTRACTION_SYSTEM_PROMPT: &str = concat!(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecognitionRequest {
+    #[serde(default)]
+    pub record_id: String,
+    #[serde(default)]
+    pub expense_id: String,
+    #[serde(default)]
+    pub file_name: String,
     pub image_data_url: String,
     pub ocr_mode: OcrMode,
     pub ocr_profile: OcrProfile,
@@ -59,6 +68,16 @@ pub struct LlmProfile {
     pub model: String,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    #[serde(default)]
+    pub multimodal: bool,
+}
+
+#[derive(Clone)]
+struct RequestContext {
+    app: AppHandle,
+    record_id: String,
+    expense_id: String,
+    file_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -109,11 +128,20 @@ pub struct RecognitionResponse {
 }
 
 #[tauri::command]
-pub async fn recognize_expense(request: RecognitionRequest) -> Result<RecognitionResponse, String> {
+pub async fn recognize_expense(
+    app: AppHandle,
+    request: RecognitionRequest,
+) -> Result<RecognitionResponse, String> {
     validate_request(&request)?;
+    let context = RequestContext {
+        app,
+        record_id: request.record_id.clone(),
+        expense_id: request.expense_id.clone(),
+        file_name: request.file_name.clone(),
+    };
     let image = decode_image_data_url(&request.image_data_url)?;
     let ocr_started = Instant::now();
-    let ocr_text = call_aliyun_ocr(&request.ocr_profile, request.ocr_mode, image).await?;
+    let ocr_text = call_aliyun_ocr(&context, &request.ocr_profile, request.ocr_mode, image).await?;
     let ocr_elapsed_ms = ocr_started.elapsed().as_millis();
 
     if ocr_text.trim().is_empty() {
@@ -121,7 +149,14 @@ pub async fn recognize_expense(request: RecognitionRequest) -> Result<Recognitio
     }
 
     let llm_started = Instant::now();
-    let extraction = call_llm(&request.llm_profile, &ocr_text, &request.reason_dictionary).await;
+    let extraction = call_llm(
+        &context,
+        &request.llm_profile,
+        &ocr_text,
+        &request.reason_dictionary,
+        &request.image_data_url,
+    )
+    .await;
     let llm_elapsed_ms = llm_started.elapsed().as_millis();
     let (extracted, llm_text, llm_error) = match extraction {
         Ok((value, content)) => (Some(value), Some(content), None),
@@ -177,6 +212,7 @@ fn decode_image_data_url(data_url: &str) -> Result<Vec<u8>, String> {
 }
 
 async fn call_aliyun_ocr(
+    context: &RequestContext,
     profile: &OcrProfile,
     mode: OcrMode,
     image: Vec<u8>,
@@ -237,44 +273,160 @@ async fn call_aliyun_ocr(
         .timeout(timeout)
         .build()
         .map_err(|_| "创建 OCR 网络客户端失败".to_string())?;
+    let request_url = endpoint.to_string();
+    let request_content = serde_json::to_string_pretty(&json!({
+        "method": "POST",
+        "action": action,
+        "apiVersion": ALIYUN_API_VERSION,
+        "region": profile.region.trim(),
+        "credential": masked_value(&profile.access_key_id),
+        "query": canonical_query,
+        "image": {
+            "sizeBytes": image.len(),
+            "sha256": payload_hash.clone(),
+        },
+        "headers": {
+            "content-type": "application/octet-stream",
+            "x-acs-date": date.clone(),
+            "x-acs-signature-nonce": nonce.clone(),
+            "signed-headers": signed_headers.clone(),
+        }
+    }))
+    .unwrap_or_else(|_| "OCR 请求内容无法序列化".to_string());
     let mut request = client
         .post(endpoint)
         .header("content-type", "application/octet-stream")
         .header("x-acs-action", action)
         .header("x-acs-version", ALIYUN_API_VERSION)
-        .header("x-acs-date", date)
-        .header("x-acs-signature-nonce", nonce)
-        .header("x-acs-content-sha256", payload_hash)
+        .header("x-acs-date", &date)
+        .header("x-acs-signature-nonce", &nonce)
+        .header("x-acs-content-sha256", &payload_hash)
         .header("authorization", authorization);
     if !profile.region.trim().is_empty() {
         request = request.header("x-acs-region-id", profile.region.trim());
     }
-    let response = request
-        .body(image)
-        .send()
-        .await
-        .map_err(|error| network_error("阿里云 OCR", error))?;
+    let requested_at = now_iso8601();
+    let started = Instant::now();
+    let response = match request.body(image).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let message = network_error("阿里云 OCR", error);
+            record_request_attempt(
+                context,
+                "ocr",
+                profile.name.as_str(),
+                None,
+                Some(action),
+                &request_url,
+                requested_at,
+                started.elapsed().as_millis(),
+                None,
+                false,
+                &request_content,
+                None,
+                Some(&message),
+            )
+            .await;
+            return Err(message);
+        }
+    };
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|_| "读取阿里云 OCR 响应失败".to_string())?;
-    let value: Value = serde_json::from_str(&body).map_err(|_| {
-        format!(
-            "阿里云 OCR 返回了无法解析的响应（HTTP {}）",
-            status.as_u16()
-        )
-    })?;
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) => {
+            let message = "读取阿里云 OCR 响应失败".to_string();
+            record_request_attempt(
+                context,
+                "ocr",
+                profile.name.as_str(),
+                None,
+                Some(action),
+                &request_url,
+                requested_at,
+                started.elapsed().as_millis(),
+                Some(status.as_u16()),
+                false,
+                &request_content,
+                None,
+                Some(&message),
+            )
+            .await;
+            return Err(message);
+        }
+    };
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            let message = format!(
+                "阿里云 OCR 返回了无法解析的响应（HTTP {}）",
+                status.as_u16()
+            );
+            record_request_attempt(
+                context,
+                "ocr",
+                profile.name.as_str(),
+                None,
+                Some(action),
+                &request_url,
+                requested_at,
+                started.elapsed().as_millis(),
+                Some(status.as_u16()),
+                false,
+                &request_content,
+                Some(&body),
+                Some(&message),
+            )
+            .await;
+            return Err(message);
+        }
+    };
     if !status.is_success() {
-        return Err(api_error("阿里云 OCR", status.as_u16(), &value));
+        let message = api_error("阿里云 OCR", status.as_u16(), &value);
+        record_request_attempt(
+            context,
+            "ocr",
+            profile.name.as_str(),
+            None,
+            Some(action),
+            &request_url,
+            requested_at,
+            started.elapsed().as_millis(),
+            Some(status.as_u16()),
+            false,
+            &request_content,
+            Some(&body),
+            Some(&message),
+        )
+        .await;
+        return Err(message);
     }
-    extract_ocr_text(&value).ok_or_else(|| "阿里云 OCR 响应中缺少文字内容".to_string())
+    let result =
+        extract_ocr_text(&value).ok_or_else(|| "阿里云 OCR 响应中缺少文字内容".to_string());
+    record_request_attempt(
+        context,
+        "ocr",
+        profile.name.as_str(),
+        None,
+        Some(action),
+        &request_url,
+        requested_at,
+        started.elapsed().as_millis(),
+        Some(status.as_u16()),
+        result.is_ok(),
+        &request_content,
+        Some(&body),
+        result.as_ref().err().map(String::as_str),
+    )
+    .await;
+    result
 }
 
 async fn call_llm(
+    context: &RequestContext,
     profile: &LlmProfile,
     ocr_text: &str,
     reasons: &[String],
+    image_data_url: &str,
 ) -> Result<(ExtractedExpense, String), (String, Option<String>)> {
     let endpoint =
         chat_completions_endpoint(&profile.base_url).map_err(|message| (message, None))?;
@@ -282,15 +434,27 @@ async fn call_llm(
     let user_prompt = format!(
         "事由字典：{reason_json}\n\nOCR 原文：\n{ocr_text}\n\n严格按此结构返回 JSON：{{\"occurredDate\":null,\"reasonName\":null,\"description\":null,\"amount\":null,\"confidence\":{{}},\"evidence\":{{}}}}"
     );
-    let request_body = llm_request_body(profile, &endpoint, &user_prompt);
+    let request_body = llm_request_body(
+        profile,
+        &endpoint,
+        &user_prompt,
+        profile.multimodal.then_some(image_data_url),
+    );
     let timeout = Duration::from_secs(profile.timeout_seconds.clamp(5, 180));
     let client = Client::builder()
         .timeout(timeout)
         .build()
         .map_err(|_| ("创建大模型网络客户端失败".to_string(), None))?;
-    let first_response = send_llm_request(&client, &endpoint, profile, &request_body)
-        .await
-        .map_err(|message| (message, None))?;
+    let first_response = send_llm_request(
+        context,
+        &client,
+        &endpoint,
+        profile,
+        &request_body,
+        "首次结构化提取",
+    )
+    .await
+    .map_err(|message| (message, None))?;
     let first_content = extract_llm_content(&first_response);
     let first_error = match first_content.as_deref() {
         Some(content) => match parse_extracted_expense(content, reasons) {
@@ -304,15 +468,27 @@ async fn call_llm(
     let retry_prompt = format!(
         "上一次响应未通过 JSON 校验：{first_error}\n\n事由字典：{reason_json}\n\nOCR 原文：\n{ocr_text}\n\n上一次响应记录：\n{first_record}\n\n重新提取并只返回一个合法 JSON 对象。必须包含 occurredDate、reasonName、description、amount、confidence、evidence。"
     );
-    let retry_body = llm_request_body(profile, &endpoint, &retry_prompt);
-    let retry_response = send_llm_request(&client, &endpoint, profile, &retry_body)
-        .await
-        .map_err(|message| {
-            (
-                format!("{first_error}；严格 JSON 重试失败：{message}"),
-                None,
-            )
-        })?;
+    let retry_body = llm_request_body(
+        profile,
+        &endpoint,
+        &retry_prompt,
+        profile.multimodal.then_some(image_data_url),
+    );
+    let retry_response = send_llm_request(
+        context,
+        &client,
+        &endpoint,
+        profile,
+        &retry_body,
+        "严格 JSON 重试",
+    )
+    .await
+    .map_err(|message| {
+        (
+            format!("{first_error}；严格 JSON 重试失败：{message}"),
+            None,
+        )
+    })?;
     let retry_content = extract_llm_content(&retry_response)
         .ok_or_else(|| ("大模型严格重试后仍未返回可用文本内容".to_string(), None))?;
     let extracted = parse_extracted_expense(&retry_content, reasons).map_err(|message| {
@@ -324,12 +500,27 @@ async fn call_llm(
     Ok((extracted, normalized_json_record(&retry_content)))
 }
 
-fn llm_request_body(profile: &LlmProfile, endpoint: &Url, user_prompt: &str) -> Value {
+fn llm_request_body(
+    profile: &LlmProfile,
+    endpoint: &Url,
+    user_prompt: &str,
+    image_data_url: Option<&str>,
+) -> Value {
+    let user_content = match image_data_url {
+        Some(image_data_url) => json!([
+            { "type": "text", "text": user_prompt },
+            {
+                "type": "image_url",
+                "image_url": { "url": image_data_url }
+            }
+        ]),
+        None => json!(user_prompt),
+    };
     let mut body = json!({
         "model": profile.model.trim(),
         "messages": [
             { "role": "system", "content": EXTRACTION_SYSTEM_PROMPT },
-            { "role": "user", "content": user_prompt }
+            { "role": "user", "content": user_content }
         ],
         "response_format": { "type": "json_object" },
         "temperature": 0,
@@ -346,29 +537,223 @@ fn llm_request_body(profile: &LlmProfile, endpoint: &Url, user_prompt: &str) -> 
 }
 
 async fn send_llm_request(
+    context: &RequestContext,
     client: &Client,
     endpoint: &Url,
     profile: &LlmProfile,
     request_body: &Value,
+    attempt: &str,
 ) -> Result<Value, String> {
-    let response = client
+    let request_url = endpoint.to_string();
+    let request_content = serde_json::to_string_pretty(&redacted_request_body(request_body))
+        .unwrap_or_else(|_| "大模型请求内容无法序列化".to_string());
+    let requested_at = now_iso8601();
+    let started = Instant::now();
+    let response = match client
         .post(endpoint.clone())
         .bearer_auth(profile.api_key.trim())
         .json(request_body)
         .send()
         .await
-        .map_err(|error| network_error("大模型", error))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let message = network_error("大模型", error);
+            record_request_attempt(
+                context,
+                "llm",
+                profile.name.as_str(),
+                Some(profile.model.as_str()),
+                Some(attempt),
+                &request_url,
+                requested_at,
+                started.elapsed().as_millis(),
+                None,
+                false,
+                &request_content,
+                None,
+                Some(&message),
+            )
+            .await;
+            return Err(message);
+        }
+    };
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|_| "读取大模型响应失败".to_string())?;
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|_| format!("大模型返回了无法解析的响应（HTTP {}）", status.as_u16()))?;
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) => {
+            let message = "读取大模型响应失败".to_string();
+            record_request_attempt(
+                context,
+                "llm",
+                profile.name.as_str(),
+                Some(profile.model.as_str()),
+                Some(attempt),
+                &request_url,
+                requested_at,
+                started.elapsed().as_millis(),
+                Some(status.as_u16()),
+                false,
+                &request_content,
+                None,
+                Some(&message),
+            )
+            .await;
+            return Err(message);
+        }
+    };
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            let message = format!("大模型返回了无法解析的响应（HTTP {}）", status.as_u16());
+            record_request_attempt(
+                context,
+                "llm",
+                profile.name.as_str(),
+                Some(profile.model.as_str()),
+                Some(attempt),
+                &request_url,
+                requested_at,
+                started.elapsed().as_millis(),
+                Some(status.as_u16()),
+                false,
+                &request_content,
+                Some(&body),
+                Some(&message),
+            )
+            .await;
+            return Err(message);
+        }
+    };
     if !status.is_success() {
-        return Err(api_error("大模型", status.as_u16(), &value));
+        let message = api_error("大模型", status.as_u16(), &value);
+        record_request_attempt(
+            context,
+            "llm",
+            profile.name.as_str(),
+            Some(profile.model.as_str()),
+            Some(attempt),
+            &request_url,
+            requested_at,
+            started.elapsed().as_millis(),
+            Some(status.as_u16()),
+            false,
+            &request_content,
+            Some(&body),
+            Some(&message),
+        )
+        .await;
+        return Err(message);
     }
+    record_request_attempt(
+        context,
+        "llm",
+        profile.name.as_str(),
+        Some(profile.model.as_str()),
+        Some(attempt),
+        &request_url,
+        requested_at,
+        started.elapsed().as_millis(),
+        Some(status.as_u16()),
+        true,
+        &request_content,
+        Some(&body),
+        None,
+    )
+    .await;
     Ok(value)
+}
+
+fn masked_value(value: &str) -> String {
+    let characters = value.trim().chars().collect::<Vec<_>>();
+    if characters.len() <= 8 {
+        return "*".repeat(characters.len());
+    }
+    format!(
+        "{}****{}",
+        characters[..4].iter().collect::<String>(),
+        characters[characters.len() - 4..]
+            .iter()
+            .collect::<String>()
+    )
+}
+
+fn redacted_request_body(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(redacted_request_body).collect()),
+        Value::Object(items) => Value::Object(
+            items
+                .iter()
+                .map(|(key, value)| (key.clone(), redacted_request_body(value)))
+                .collect(),
+        ),
+        Value::String(value)
+            if value
+                .as_bytes()
+                .get(..11)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"data:image/")) =>
+        {
+            Value::String(format!(
+                "[图片数据已省略，原始字符数 {}]",
+                value.chars().count()
+            ))
+        }
+        _ => value.clone(),
+    }
+}
+
+fn redacted_response_content(value: &str) -> String {
+    if let Ok(json_value) = serde_json::from_str::<Value>(value) {
+        return serde_json::to_string_pretty(&redacted_request_body(&json_value))
+            .unwrap_or_else(|_| "响应内容无法序列化".to_string());
+    }
+    if value
+        .as_bytes()
+        .windows(11)
+        .any(|prefix| prefix.eq_ignore_ascii_case(b"data:image/"))
+    {
+        return "[响应包含图片数据，已全部省略]".to_string();
+    }
+    value.to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_request_attempt(
+    context: &RequestContext,
+    service: &str,
+    profile_name: &str,
+    model: Option<&str>,
+    action: Option<&str>,
+    request_url: &str,
+    requested_at: String,
+    duration_ms: u128,
+    http_status: Option<u16>,
+    success: bool,
+    request_content: &str,
+    response_content: Option<&str>,
+    error: Option<&str>,
+) {
+    let _ = append_request_log(
+        &context.app,
+        RequestLogInput {
+            service: service.to_string(),
+            record_id: context.record_id.clone(),
+            expense_id: context.expense_id.clone(),
+            file_name: context.file_name.clone(),
+            profile_name: profile_name.to_string(),
+            model: model.map(str::to_string),
+            action: action.map(str::to_string),
+            request_url: request_url.to_string(),
+            requested_at,
+            duration_ms,
+            http_status,
+            success,
+            error: error.map(str::to_string),
+            request_content: request_content.to_string(),
+            response_content: response_content.map(redacted_response_content),
+        },
+    )
+    .await;
 }
 
 fn extract_llm_content(response: &Value) -> Option<String> {
@@ -753,9 +1138,10 @@ mod tests {
             api_key: "test-key".to_string(),
             model: "deepseek-v4-flash".to_string(),
             timeout_seconds: 30,
+            multimodal: false,
         };
         let endpoint = chat_completions_endpoint(&profile.base_url).expect("endpoint");
-        let request = llm_request_body(&profile, &endpoint, "返回 JSON");
+        let request = llm_request_body(&profile, &endpoint, "返回 JSON", None);
         assert_eq!(
             request.pointer("/response_format/type"),
             Some(&json!("json_object"))
@@ -763,8 +1149,52 @@ mod tests {
         assert_eq!(request.pointer("/thinking/type"), Some(&json!("disabled")));
 
         let openai = Url::parse("https://api.openai.com/v1/chat/completions").expect("url");
-        let request = llm_request_body(&profile, &openai, "返回 JSON");
+        let request = llm_request_body(&profile, &openai, "返回 JSON", None);
         assert!(request.get("thinking").is_none());
+    }
+
+    #[test]
+    fn multimodal_request_contains_image_but_log_copy_redacts_it() {
+        let profile = LlmProfile {
+            name: "Vision".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            model: "vision-model".to_string(),
+            timeout_seconds: 30,
+            multimodal: true,
+        };
+        let endpoint = chat_completions_endpoint(&profile.base_url).expect("endpoint");
+        let image = "data:image/png;base64,SGVsbG8=";
+        let request = llm_request_body(&profile, &endpoint, "返回 JSON", Some(image));
+        assert_eq!(
+            request.pointer("/messages/1/content/0/text"),
+            Some(&json!("返回 JSON"))
+        );
+        assert_eq!(
+            request.pointer("/messages/1/content/1/image_url/url"),
+            Some(&json!(image))
+        );
+
+        let redacted = redacted_request_body(&request);
+        assert_eq!(
+            redacted.pointer("/messages/1/content/1/image_url/url"),
+            Some(&json!("[图片数据已省略，原始字符数 30]"))
+        );
+        assert!(!redacted.to_string().contains("SGVsbG8="));
+
+        let response = redacted_response_content(&json!({ "echo": image }).to_string());
+        assert!(!response.contains("SGVsbG8="));
+        assert!(response.contains("图片数据已省略"));
+        assert_eq!(
+            redacted_response_content("invalid: data:image/png;base64,SGVsbG8="),
+            "[响应包含图片数据，已全部省略]"
+        );
+    }
+
+    #[test]
+    fn masks_credentials_without_utf8_boundary_panics() {
+        assert_eq!(masked_value("abcdefghijk"), "abcd****hijk");
+        assert_eq!(masked_value("访问密钥测试值"), "*******");
     }
 
     #[test]

@@ -138,7 +138,7 @@ fn load_workspace_blocking(root: &Path) -> Result<Option<LoadedWorkspace>, Strin
     }))
 }
 
-fn storage_root(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn storage_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|error| format!("无法确定应用数据目录：{error}"))
@@ -167,7 +167,7 @@ fn storage_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
         .map_err(|_| "本地存储锁异常".to_string())
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("创建本地数据目录失败：{error}"))?;
     }
@@ -189,7 +189,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
     Ok(())
 }
 
-fn read_json_with_backup<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+pub(crate) fn read_json_with_backup<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     match read_json(path) {
         Ok(value) => Ok(value),
         Err(primary_error) => {
