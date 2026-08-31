@@ -170,7 +170,6 @@ interface HistoryFolder {
 }
 interface CellSelection {
   recordId: string;
-  pageIndex: number;
   columnIndex: number;
   startRow: number;
   endRow: number;
@@ -1277,16 +1276,16 @@ function isPaperCellSelected(
   columnIndex: number,
 ) {
   const selection = cellSelection.value;
+  const row = formPages.value[pageIndex]?.rows[rowIndex];
   if (
     !selection ||
     selection.recordId !== draft.id ||
-    selection.pageIndex !== pageIndex ||
     selection.columnIndex !== columnIndex
   )
     return false;
   const start = Math.min(selection.startRow, selection.endRow);
   const end = Math.max(selection.startRow, selection.endRow);
-  return rowIndex >= start && rowIndex <= end;
+  return row ? row.index >= start && row.index <= end : false;
 }
 function startPaperCellSelection(
   event: PointerEvent,
@@ -1295,22 +1294,21 @@ function startPaperCellSelection(
   columnIndex: number,
 ) {
   if (event.button !== 0 || !(event.target instanceof Element)) return;
-  if (
-    event.target.closest(
-      "button, input, textarea, select, .paper-row-drag-handle",
-    )
-  )
+  if (event.target.closest("input, textarea, select, .paper-row-drag-handle"))
     return;
-  event.preventDefault();
-  event.stopPropagation();
+  const interactive = event.target.closest("button");
+  if (!interactive) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
   commitActiveEdit();
   document.body.style.userSelect = "none";
+  const row = formPages.value[pageIndex]?.rows[rowIndex];
   cellSelection.value = {
     recordId: draft.id,
-    pageIndex,
     columnIndex,
-    startRow: rowIndex,
-    endRow: rowIndex,
+    startRow: row?.index ?? rowIndex,
+    endRow: row?.index ?? rowIndex,
   };
 }
 function extendPaperCellSelection(
@@ -1321,16 +1319,17 @@ function extendPaperCellSelection(
 ) {
   const selection = cellSelection.value;
   if (!(event.buttons & 1)) return;
+  const row = formPages.value[pageIndex]?.rows[rowIndex];
   if (
     !selection ||
     selection.recordId !== draft.id ||
-    selection.pageIndex !== pageIndex ||
-    selection.columnIndex !== columnIndex
+    selection.columnIndex !== columnIndex ||
+    !row
   )
     return;
   event.preventDefault();
   event.stopPropagation();
-  selection.endRow = rowIndex;
+  selection.endRow = row.index;
 }
 function endPaperCellSelection() {
   if (cellSelection.value) document.body.style.userSelect = "";
@@ -1338,13 +1337,11 @@ function endPaperCellSelection() {
 function selectedPaperCellText() {
   const selection = cellSelection.value;
   if (!selection || selection.recordId !== draft.id) return "";
-  const page = formPages.value[selection.pageIndex];
-  if (!page) return "";
   const start = Math.min(selection.startRow, selection.endRow);
   const end = Math.max(selection.startRow, selection.endRow);
-  return page.rows
+  return draft.expenses
     .slice(start, end + 1)
-    .map((row) => paperCellValue(row.expense, selection.columnIndex))
+    .map((expense) => paperCellValue(expense, selection.columnIndex))
     .join("\n");
 }
 async function copySelectedPaperCells() {
