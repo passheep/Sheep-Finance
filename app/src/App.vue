@@ -21,6 +21,7 @@ import {
   DocumentAdd,
   Download,
   EditPen,
+  Folder,
   InfoFilled,
   Iphone,
   Picture,
@@ -51,6 +52,7 @@ type OcrStatus =
   "queued" | "recognizing" | "success" | "partial" | "error" | "manual";
 type AppTab = "reimbursement" | "history" | "requests" | "settings" | "about";
 type PreviewMode = "single" | "double";
+type HistoryViewMode = "company" | "status" | "list";
 type ReimbursementStatus = "未报销" | "报销中" | "已报销";
 type ExpenseEditableField =
   "occurredDate" | "reason" | "description" | "arranger" | "amountCents";
@@ -156,8 +158,22 @@ interface HistoryRecord {
   reimbursementDate: string;
   expenseCount: number;
   totalCents: number;
+  firstOccurredDate?: string;
   updatedAt: string;
   draft?: Draft;
+}
+interface HistoryFolder {
+  key: string;
+  label: string;
+  count: number;
+  deleted?: boolean;
+}
+interface CellSelection {
+  recordId: string;
+  pageIndex: number;
+  columnIndex: number;
+  startRow: number;
+  endRow: number;
 }
 interface OcrProfile {
   id: string;
@@ -239,6 +255,10 @@ interface LoadedWorkspace {
   };
   services: { ocrProfiles?: OcrProfile[]; llmProfiles?: LlmProfile[] };
   history: HistoryRecord[];
+  uiPreferences?: {
+    leftPanelWidth?: number;
+    historyViewMode?: HistoryViewMode;
+  };
   dataDirectory: string;
 }
 interface ConfigurationTransferPayload {
@@ -284,6 +304,7 @@ const PROFILE_KEY = "sheepfinance:profiles:v1";
 const DICTIONARY_KEY = "sheepfinance:dictionaries:v1";
 const HISTORY_KEY = "sheepfinance:history:v1";
 const SERVICE_KEY = "sheepfinance:services:v1";
+const UI_PREFERENCES_KEY = "sheepfinance:ui-preferences:v1";
 const PAGE_WIDTH = 794;
 const PAGE_HEIGHT = 1123;
 const MAX_EXPENSES = 10;
@@ -431,6 +452,12 @@ const historyDate = ref("");
 const historyStatus = ref<ReimbursementStatus | "">("");
 const historyPage = ref(1);
 const historyPageSize = ref(8);
+const historyViewMode = ref<HistoryViewMode>("company");
+const historyFolderKey = ref("");
+const isHistoryPreviewOpen = ref(false);
+const isHistoryPreviewLoading = ref(false);
+const historyPreviewItem = ref<HistoryRecord | null>(null);
+const historyPreviewDraft = ref<Draft | null>(null);
 const requestRecords = ref<RequestLogSummary[]>([]);
 const requestSearch = ref("");
 const requestService = ref<"ocr" | "llm" | "">("");
@@ -446,7 +473,14 @@ const newReason = ref("");
 const newArranger = ref("");
 const saveTimer = ref<number | null>(null);
 const lanReceivedCount = ref(0);
+const leftPanelWidth = ref(404);
+const leftPanelResizeState = ref<{
+  startX: number;
+  startWidth: number;
+} | null>(null);
+const cellSelection = ref<CellSelection | null>(null);
 let autoSaveRevision = 0;
+let suppressAutoSave = false;
 let lanUploadClockTimer: number | null = null;
 let lanUploadNoticeTimer: number | null = null;
 let lanUploadUnlisten: UnlistenFn | null = null;
@@ -652,6 +686,54 @@ const filteredHistory = computed(() => {
     return matchesKeyword && matchesDate && matchesStatus;
   });
 });
+const historyFolders = computed<HistoryFolder[]>(() => {
+  if (historyViewMode.value === "list") return [];
+  const groups = new Map<string, HistoryFolder>();
+  filteredHistory.value.forEach((item) => {
+    const key =
+      historyViewMode.value === "status"
+        ? `status:${item.status}`
+        : `company:${item.companyName || "未填写公司"}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.count += 1;
+      return;
+    }
+    const companyLabel = item.companyName || "未填写公司";
+    groups.set(key, {
+      key,
+      label: historyViewMode.value === "status" ? item.status : companyLabel,
+      count: 1,
+      deleted:
+        historyViewMode.value === "company" &&
+        companyLabel !== "未填写公司" &&
+        !companyNames.value.includes(companyLabel),
+    });
+  });
+  return [...groups.values()].sort((left, right) => {
+    if (historyViewMode.value === "status") {
+      return (
+        REIMBURSEMENT_STATUSES.indexOf(left.label as ReimbursementStatus) -
+        REIMBURSEMENT_STATUSES.indexOf(right.label as ReimbursementStatus)
+      );
+    }
+    return left.label.localeCompare(right.label, "zh-CN");
+  });
+});
+const historyScopedRecords = computed(() => {
+  if (historyViewMode.value === "list" || !historyFolderKey.value)
+    return historyViewMode.value === "list" ? filteredHistory.value : [];
+  return filteredHistory.value.filter((item) => {
+    if (historyViewMode.value === "status")
+      return historyFolderKey.value === `status:${item.status}`;
+    return (
+      historyFolderKey.value === `company:${item.companyName || "未填写公司"}`
+    );
+  });
+});
+const historyCurrentFolder = computed(() =>
+  historyFolders.value.find((item) => item.key === historyFolderKey.value),
+);
 const lastEditedHistoryId = computed(
   () =>
     [...historyRecords.value]
@@ -663,7 +745,7 @@ const lastEditedHistoryId = computed(
       )[0]?.id ?? "",
 );
 const pagedHistory = computed(() =>
-  filteredHistory.value.slice(
+  historyScopedRecords.value.slice(
     (historyPage.value - 1) * historyPageSize.value,
     historyPage.value * historyPageSize.value,
   ),
@@ -715,8 +797,88 @@ const currentProfileId = computed({
   },
 });
 
+function parseAmountExpression(raw: string) {
+  let source = raw.trim().replace(/[,，]/g, "");
+  if (!source) return 0;
+  if (source.startsWith("=")) source = source.slice(1).trim();
+  if (!source || source.length > 160) return null;
+  let cursor = 0;
+  function skipSpaces() {
+    while (/\s/.test(source[cursor] ?? "")) cursor += 1;
+  }
+  function parseNumber() {
+    skipSpaces();
+    const match = /^(?:\d+(?:\.\d*)?|\.\d+)/.exec(source.slice(cursor));
+    if (!match) return null;
+    cursor += match[0].length;
+    const value = Number(match[0]);
+    return Number.isFinite(value) ? value : null;
+  }
+  function parsePrimary(): number | null {
+    skipSpaces();
+    if (source[cursor] === "(") {
+      cursor += 1;
+      const value = parseExpression();
+      skipSpaces();
+      if (source[cursor] !== ")" || value === null) return null;
+      cursor += 1;
+      return value;
+    }
+    return parseNumber();
+  }
+  function parseUnary(): number | null {
+    skipSpaces();
+    if (source[cursor] === "+" || source[cursor] === "-") {
+      const sign = source[cursor] === "-" ? -1 : 1;
+      cursor += 1;
+      const value = parseUnary();
+      return value === null ? null : sign * value;
+    }
+    return parsePrimary();
+  }
+  function parseTerm(): number | null {
+    let value = parseUnary();
+    if (value === null) return null;
+    while (true) {
+      skipSpaces();
+      const operator = source[cursor];
+      if (operator !== "*" && operator !== "/") return value;
+      cursor += 1;
+      const right = parseUnary();
+      if (right === null || (operator === "/" && right === 0)) return null;
+      value = operator === "*" ? value * right : value / right;
+      if (!Number.isFinite(value)) return null;
+    }
+  }
+  function parseExpression(): number | null {
+    let value = parseTerm();
+    if (value === null) return null;
+    while (true) {
+      skipSpaces();
+      const operator = source[cursor];
+      if (operator !== "+" && operator !== "-") return value;
+      cursor += 1;
+      const right = parseTerm();
+      if (right === null) return null;
+      value = operator === "+" ? value + right : value - right;
+      if (!Number.isFinite(value)) return null;
+    }
+  }
+  const result = parseExpression();
+  skipSpaces();
+  return result !== null && cursor === source.length && Number.isFinite(result)
+    ? Math.abs(result) <= 1_000_000_000_000
+      ? result
+      : null
+    : null;
+}
+function amountExpressionToCents(raw: string) {
+  const value = parseAmountExpression(raw);
+  return value === null ? null : Math.round(value * 100);
+}
 function money(cents: number) {
-  return (cents / 100).toLocaleString("zh-CN", {
+  const value = Object.is(cents, -0) ? 0 : cents;
+  return (value / 100).toLocaleString("zh-CN", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
@@ -725,6 +887,9 @@ function normalizeReimbursementStatus(value: unknown): ReimbursementStatus {
   return REIMBURSEMENT_STATUSES.includes(value as ReimbursementStatus)
     ? (value as ReimbursementStatus)
     : "未报销";
+}
+function normalizeHistoryViewMode(value: unknown): HistoryViewMode {
+  return value === "status" || value === "list" ? value : "company";
 }
 function reimbursementStatusType(status: ReimbursementStatus) {
   if (status === "已报销") return "success";
@@ -736,12 +901,26 @@ async function cycleHistoryStatus(item: HistoryRecord) {
   item.status =
     REIMBURSEMENT_STATUSES[(index + 1) % REIMBURSEMENT_STATUSES.length];
   item.updatedAt = new Date().toISOString();
+  if (historyPreviewItem.value?.id === item.id && historyPreviewDraft.value)
+    historyPreviewDraft.value.status = item.status;
   if (item.id === draft.id) {
     draft.status = item.status;
     dirty();
+    if (
+      historyViewMode.value === "status" &&
+      historyFolderKey.value &&
+      !historyScopedRecords.value.length
+    )
+      leaveHistoryFolder();
     return;
   }
   await persistDraft(false);
+  if (
+    historyViewMode.value === "status" &&
+    historyFolderKey.value &&
+    !historyScopedRecords.value.length
+  )
+    leaveHistoryFolder();
 }
 function formatDateTime(value: string) {
   const date = new Date(value);
@@ -769,7 +948,9 @@ function ChineseAmount(cents: number) {
   const digits = "零壹贰叁肆伍陆柒捌玖";
   const units = ["", "拾", "佰", "仟"];
   const bigUnits = ["", "万", "亿", "兆"];
-  const value = Math.max(0, Math.round(cents));
+  const negative = cents < 0;
+  const value = Math.abs(Math.round(cents));
+  const withSign = (text: string) => (negative && value ? `负${text}` : text);
   const yuan = Math.floor(value / 100);
   const jiao = Math.floor((value % 100) / 10);
   const fen = value % 10;
@@ -812,12 +993,13 @@ function ChineseAmount(cents: number) {
   if (!jiao && fen) text += "零";
   if (fen) text += `${digits[fen]}分`;
   if (!jiao && !fen) text += "整";
-  return text;
+  return withSign(text);
 }
 function fieldKey(expense: Expense, field: string) {
   return `expense:${expense.id}:${field}`;
 }
 function dirty() {
+  cellSelection.value = null;
   isSaved.value = false;
   saveText.value = "尚未保存";
   draft.updatedAt = new Date().toISOString();
@@ -841,10 +1023,13 @@ function commitHeader(field: HeaderEditableField) {
 function commitExpense(expense: Expense, field: ExpenseEditableField) {
   if (editingKey.value !== fieldKey(expense, field)) return;
   if (field === "amountCents") {
-    const amount = Number(editValue.value);
-    expense.amountCents = Number.isFinite(amount)
-      ? Math.max(0, Math.round(amount * 100))
-      : 0;
+    const amount = amountExpressionToCents(editValue.value);
+    if (amount === null) {
+      ElMessage.warning("金额表达式无法计算，请检查数字和运算符");
+      cancelEdit();
+      return;
+    }
+    expense.amountCents = amount;
   } else expense[field] = editValue.value as never;
   expense.manualFields[field] = true;
   expense.ocrStatus = "manual";
@@ -897,10 +1082,13 @@ function updateAmountInput(expense: Expense, value: string) {
 function commitAmountInput(expense: Expense) {
   const rawValue = amountInputValues[expense.id];
   if (rawValue === undefined) return;
-  const amount = Number(rawValue.trim().replace(/,/g, ""));
-  expense.amountCents = Number.isFinite(amount)
-    ? Math.max(0, Math.round(amount * 100))
-    : 0;
+  const amount = amountExpressionToCents(rawValue);
+  if (amount === null) {
+    ElMessage.warning("金额表达式无法计算，请检查数字和运算符");
+    delete amountInputValues[expense.id];
+    return;
+  }
+  expense.amountCents = amount;
   delete amountInputValues[expense.id];
   expense.manualFields.amountCents = true;
   expense.ocrStatus = "manual";
@@ -1070,6 +1258,120 @@ function selectAttachment(
 ) {
   selectedId.value = attachment.expenseId;
   selectedAttachmentId.value = attachment.id;
+}
+function paperCellValue(expense: Expense, columnIndex: number) {
+  return (
+    [
+      String(draft.expenses.indexOf(expense) + 1),
+      expense.occurredDate || "",
+      expense.reason || "",
+      expense.description || "",
+      expense.arranger || "",
+      (expense.amountCents / 100).toFixed(2),
+    ][columnIndex] ?? ""
+  );
+}
+function isPaperCellSelected(
+  pageIndex: number,
+  rowIndex: number,
+  columnIndex: number,
+) {
+  const selection = cellSelection.value;
+  if (
+    !selection ||
+    selection.recordId !== draft.id ||
+    selection.pageIndex !== pageIndex ||
+    selection.columnIndex !== columnIndex
+  )
+    return false;
+  const start = Math.min(selection.startRow, selection.endRow);
+  const end = Math.max(selection.startRow, selection.endRow);
+  return rowIndex >= start && rowIndex <= end;
+}
+function startPaperCellSelection(
+  event: PointerEvent,
+  pageIndex: number,
+  rowIndex: number,
+  columnIndex: number,
+) {
+  if (event.button !== 0 || !(event.target instanceof Element)) return;
+  if (
+    event.target.closest(
+      "button, input, textarea, select, .paper-row-drag-handle",
+    )
+  )
+    return;
+  event.preventDefault();
+  event.stopPropagation();
+  commitActiveEdit();
+  document.body.style.userSelect = "none";
+  cellSelection.value = {
+    recordId: draft.id,
+    pageIndex,
+    columnIndex,
+    startRow: rowIndex,
+    endRow: rowIndex,
+  };
+}
+function extendPaperCellSelection(
+  event: PointerEvent,
+  pageIndex: number,
+  rowIndex: number,
+  columnIndex: number,
+) {
+  const selection = cellSelection.value;
+  if (!(event.buttons & 1)) return;
+  if (
+    !selection ||
+    selection.recordId !== draft.id ||
+    selection.pageIndex !== pageIndex ||
+    selection.columnIndex !== columnIndex
+  )
+    return;
+  event.preventDefault();
+  event.stopPropagation();
+  selection.endRow = rowIndex;
+}
+function endPaperCellSelection() {
+  if (cellSelection.value) document.body.style.userSelect = "";
+}
+function selectedPaperCellText() {
+  const selection = cellSelection.value;
+  if (!selection || selection.recordId !== draft.id) return "";
+  const page = formPages.value[selection.pageIndex];
+  if (!page) return "";
+  const start = Math.min(selection.startRow, selection.endRow);
+  const end = Math.max(selection.startRow, selection.endRow);
+  return page.rows
+    .slice(start, end + 1)
+    .map((row) => paperCellValue(row.expense, selection.columnIndex))
+    .join("\n");
+}
+async function copySelectedPaperCells() {
+  const value = selectedPaperCellText();
+  if (!value) return ElMessage.info("请先拖动选中要复制的单元格");
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    const input = document.createElement("textarea");
+    input.value = value;
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+  ElMessage.success("已复制选中单元格");
+}
+function handleGlobalKeydown(event: KeyboardEvent) {
+  if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "c")
+    return;
+  const target = event.target as HTMLElement | null;
+  if (target?.closest("input, textarea, select")) return;
+  if (!cellSelection.value) return;
+  event.preventDefault();
+  void copySelectedPaperCells();
 }
 function reflowAttachments() {
   const attachments = previewAttachments.value;
@@ -1668,12 +1970,48 @@ function expenseDragStop() {
   expenseDragState.value = null;
 }
 function updateScale() {
+  if (!leftPanelResizeState.value)
+    leftPanelWidth.value = clampLeftPanelWidth(leftPanelWidth.value);
   const viewport = previewViewport.value;
   if (!viewport) return;
   paperScale.value = Math.min(
     1,
     Math.max(0.56, (viewport.clientWidth - 52) / PAGE_WIDTH),
   );
+}
+function clampLeftPanelWidth(value: number) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 404;
+  const max = Math.max(520, Math.min(720, window.innerWidth - 560));
+  return Math.round(Math.min(max, Math.max(300, numeric)));
+}
+function startLeftPanelResize(event: PointerEvent) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  leftPanelResizeState.value = {
+    startX: event.clientX,
+    startWidth: leftPanelWidth.value,
+  };
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+  (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(
+    event.pointerId,
+  );
+}
+function moveLeftPanelResize(event: PointerEvent) {
+  const state = leftPanelResizeState.value;
+  if (!state) return;
+  event.preventDefault();
+  leftPanelWidth.value = clampLeftPanelWidth(
+    state.startWidth + event.clientX - state.startX,
+  );
+}
+function stopLeftPanelResize() {
+  if (!leftPanelResizeState.value) return;
+  leftPanelResizeState.value = null;
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+  scheduleAutoSave();
 }
 function pointerStart(
   event: PointerEvent,
@@ -1818,8 +2156,40 @@ async function removeSelectedAttachment() {
 function printCurrentPage() {
   window.print();
 }
+async function printHistory(item: HistoryRecord) {
+  try {
+    const source = await loadHistoryDraft(item);
+    await withTemporaryDraft(source, async () => {
+      window.print();
+    });
+  } catch (error) {
+    ElMessage.error(`历史单据打印失败：${errorMessage(error)}`);
+  }
+}
+async function exportHistoryExcel(item: HistoryRecord) {
+  try {
+    const source = await loadHistoryDraft(item);
+    await exportExcel(source);
+  } catch (error) {
+    ElMessage.error(`历史单据 Excel 导出失败：${errorMessage(error)}`);
+  }
+}
+async function exportHistoryPdf(item: HistoryRecord) {
+  try {
+    const source = await loadHistoryDraft(item);
+    await exportPdf(source);
+  } catch (error) {
+    ElMessage.error(`历史单据 PDF 导出失败：${errorMessage(error)}`);
+  }
+}
 function cloneDraft(value: Draft = draft) {
   return JSON.parse(JSON.stringify(value)) as Draft;
+}
+function uiPreferencesSnapshot() {
+  return {
+    leftPanelWidth: leftPanelWidth.value,
+    historyViewMode: historyViewMode.value,
+  };
 }
 function historyItem(value: Draft, includeDraft = false): HistoryRecord {
   const item: HistoryRecord = {
@@ -1833,6 +2203,7 @@ function historyItem(value: Draft, includeDraft = false): HistoryRecord {
     totalCents:
       value.totalOverrideCents ??
       value.expenses.reduce((sum, expense) => sum + expense.amountCents, 0),
+    firstOccurredDate: value.expenses[0]?.occurredDate || "",
     updatedAt: value.updatedAt,
   };
   if (includeDraft) item.draft = cloneDraft(value);
@@ -1848,17 +2219,19 @@ function normalizeHistory(value: Partial<HistoryRecord>): HistoryRecord {
     reimbursementDate: value.reimbursementDate ?? "",
     expenseCount: Number(value.expenseCount) || 0,
     totalCents: Number(value.totalCents) || 0,
+    firstOccurredDate:
+      value.firstOccurredDate ?? value.draft?.expenses?.[0]?.occurredDate ?? "",
     updatedAt: value.updatedAt ?? new Date().toISOString(),
     draft: value.draft,
   };
 }
 async function persistDraft(showMessage = false) {
-  if (isLoadingWorkspace.value) return;
+  if (isLoadingWorkspace.value || suppressAutoSave) return false;
   const revision = autoSaveRevision;
   saveText.value = showMessage ? "正在保存" : "正在自动保存";
   const snapshot = cloneDraft();
   const nextHistory = [
-    historyItem(snapshot),
+    historyItem(snapshot, !isTauriRuntime()),
     ...historyRecords.value.filter((item) => item.id !== snapshot.id),
   ];
   historyRecords.value = nextHistory;
@@ -1881,6 +2254,7 @@ async function persistDraft(showMessage = false) {
             llmProfiles: llmProfiles.value,
           },
           history: nextHistory.map(({ draft: _draft, ...summary }) => summary),
+          uiPreferences: uiPreferencesSnapshot(),
         },
       });
     } else {
@@ -1914,16 +2288,22 @@ async function persistDraft(showMessage = false) {
         }),
       );
       localStorage.setItem(HISTORY_KEY, JSON.stringify(browserHistory));
+      localStorage.setItem(
+        UI_PREFERENCES_KEY,
+        JSON.stringify(uiPreferencesSnapshot()),
+      );
     }
     isSaved.value = revision === autoSaveRevision;
     saveText.value = isSaved.value
       ? `已保存 ${formatSaveTime(new Date())}`
       : "尚未保存";
     if (showMessage) ElMessage.success("草稿已保存到本机");
+    return true;
   } catch (error) {
     isSaved.value = false;
     saveText.value = "自动保存失败";
     if (showMessage) ElMessage.error(errorMessage(error));
+    return false;
   }
 }
 function saveDraft() {
@@ -1931,16 +2311,7 @@ function saveDraft() {
   void persistDraft(true);
 }
 function applyDraft(value: Draft) {
-  Object.assign(draft, value, {
-    label: value.label ?? "",
-    status: normalizeReimbursementStatus(value.status),
-    reimbursementDate: "",
-    previewMode: value.previewMode === "double" ? "double" : "single",
-  });
-  const expenses = (value.expenses ?? []).slice(0, MAX_EXPENSES);
-  draft.expenses = expenses.map((item, index) =>
-    normalizeExpense(item, index, expenses.length),
-  );
+  Object.assign(draft, normalizeDraftForUse(value));
   selectedId.value = draft.expenses[0]?.id ?? null;
   selectedAttachmentId.value = selectedId.value;
 }
@@ -1976,6 +2347,14 @@ function applyWorkspace(value: LoadedWorkspace) {
     ocrProfiles.value = value.services.ocrProfiles.map(normalizeOcrProfile);
   if (value.services?.llmProfiles?.length)
     llmProfiles.value = value.services.llmProfiles.map(normalizeLlmProfile);
+  if (value.uiPreferences?.leftPanelWidth)
+    leftPanelWidth.value = clampLeftPanelWidth(
+      value.uiPreferences.leftPanelWidth,
+    );
+  if (value.uiPreferences?.historyViewMode)
+    historyViewMode.value = normalizeHistoryViewMode(
+      value.uiPreferences.historyViewMode,
+    );
   dataDirectory.value = value.dataDirectory;
 }
 function loadBrowserWorkspace() {
@@ -2025,6 +2404,17 @@ function loadBrowserWorkspace() {
     ocrProfiles.value = services.ocrProfiles.map(normalizeOcrProfile);
   if (services?.llmProfiles?.length)
     llmProfiles.value = services.llmProfiles.map(normalizeLlmProfile);
+  const savedUiPreferences = JSON.parse(
+    localStorage.getItem(UI_PREFERENCES_KEY) ?? "null",
+  ) as LoadedWorkspace["uiPreferences"] | null;
+  if (savedUiPreferences?.leftPanelWidth)
+    leftPanelWidth.value = clampLeftPanelWidth(
+      savedUiPreferences.leftPanelWidth,
+    );
+  if (savedUiPreferences?.historyViewMode)
+    historyViewMode.value = normalizeHistoryViewMode(
+      savedUiPreferences.historyViewMode,
+    );
   return Boolean(
     saved?.id ||
     savedProfiles?.length ||
@@ -2054,43 +2444,135 @@ async function loadDraft() {
   }
   if (migrateBrowserData) await persistDraft(false);
 }
-async function restoreHistory(item: HistoryRecord) {
+async function loadHistoryDraft(item: HistoryRecord) {
+  const raw = item.draft
+    ? cloneDraft(item.draft)
+    : await invoke<Draft>("load_record", { recordId: item.id });
+  const restored = normalizeDraftForUse(raw);
+  restored.label = item.label;
+  restored.status = item.status;
+  restored.updatedAt = item.updatedAt;
+  return restored;
+}
+async function openHistoryPreview(item: HistoryRecord) {
+  isHistoryPreviewOpen.value = true;
+  isHistoryPreviewLoading.value = true;
+  historyPreviewItem.value = item;
+  historyPreviewDraft.value = null;
   try {
-    const restored = item.draft
-      ? cloneDraft(item.draft)
-      : await invoke<Draft>("load_record", { recordId: item.id });
-    restored.label = item.label;
-    restored.status = item.status;
-    restored.updatedAt = item.updatedAt;
+    const restored = await loadHistoryDraft(item);
+    historyPreviewDraft.value = restored;
+    if (!item.firstOccurredDate && restored.expenses[0]?.occurredDate) {
+      item.firstOccurredDate = restored.expenses[0].occurredDate;
+      await persistDraft(false);
+    }
+  } catch (error) {
+    isHistoryPreviewOpen.value = false;
+    ElMessage.error(errorMessage(error));
+  } finally {
+    isHistoryPreviewLoading.value = false;
+  }
+}
+async function editHistory(item: HistoryRecord) {
+  try {
+    const restored = await loadHistoryDraft(item);
     applyDraft(restored);
+    isHistoryPreviewOpen.value = false;
     switchTab("reimbursement");
     isSaved.value = true;
     saveText.value = `已保存 ${formatSaveTime(restored.updatedAt)}`;
-    ElMessage.success("已恢复历史报销单");
+    ElMessage.success("已打开历史报销单，可继续修改");
   } catch (error) {
     ElMessage.error(errorMessage(error));
   }
 }
-async function removeHistory(item: HistoryRecord) {
-  if (item.id === draft.id)
-    return ElMessage.warning(
-      "当前打开的报销单不能删除，请先新建或恢复其他记录",
-    );
+function resetRecognitionMetadata(expense: Expense) {
+  expense.ocrStatus = "manual";
+  expense.ocrText = undefined;
+  expense.llmText = undefined;
+  expense.recognitionError = undefined;
+  expense.recognitionVersion = 0;
+  expense.recognizedFields = undefined;
+  expense.lastOcrProfile = undefined;
+  expense.lastLlmProfile = undefined;
+  expense.lastRecognitionMs = undefined;
+  expense.recognitionImageDataUrl = undefined;
+  expense.originalSizeBytes = undefined;
+  expense.recognitionSizeBytes = undefined;
+  expense.manualFields = {};
+}
+async function createFromHistoryTemplate(item: HistoryRecord) {
+  try {
+    const template = await loadHistoryDraft(item);
+    const created = cloneDraft(template);
+    created.id = id("record");
+    created.label = template.label
+      ? `${template.label} - 副本`
+      : `${template.companyName || "报销单"} - 副本`;
+    created.status = "未报销";
+    created.updatedAt = new Date().toISOString();
+    created.expenses.forEach((expense) => {
+      expense.id = id("expense");
+      resetRecognitionMetadata(expense);
+      expense.extraAttachments.forEach((attachment) => {
+        attachment.id = id("attachment");
+      });
+    });
+    applyDraft(created);
+    isHistoryPreviewOpen.value = false;
+    switchTab("reimbursement");
+    dirty();
+    ElMessage.success("已按历史单据创建新的未报销单");
+  } catch (error) {
+    ElMessage.error(errorMessage(error));
+  }
+}
+function openHistoryFolder(folder: HistoryFolder) {
+  historyFolderKey.value = folder.key;
+  historyPage.value = 1;
+}
+function leaveHistoryFolder() {
+  historyFolderKey.value = "";
+  historyPage.value = 1;
+}
+async function removeHistory(item: HistoryRecord): Promise<boolean> {
+  const deletingCurrent = item.id === draft.id;
   try {
     await ElMessageBox.confirm(
-      "将删除这条本地报销记录，不影响已经导出的文件。",
+      deletingCurrent
+        ? "当前正在编辑这张单据，删除后将自动创建一张空白报销单。已经导出的文件不受影响。"
+        : "将删除这条本地报销记录，不影响已经导出的文件。",
       "删除历史记录",
       { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" },
     );
-    if (isTauriRuntime()) await invoke("delete_record", { recordId: item.id });
+    if (deletingCurrent) {
+      suppressAutoSave = true;
+      Object.assign(draft, createDraft());
+      selectedId.value = null;
+      selectedAttachmentId.value = null;
+      suppressAutoSave = false;
+    }
     historyRecords.value = historyRecords.value.filter(
       (entry) => entry.id !== item.id,
     );
-    await persistDraft(false);
+    const saved = await persistDraft(false);
+    if (!saved) throw new Error("本地工作区保存失败，未执行记录删除");
+    if (isTauriRuntime()) await invoke("delete_record", { recordId: item.id });
+    if (historyFolderKey.value && !historyScopedRecords.value.length)
+      leaveHistoryFolder();
     ElMessage.success("历史记录已删除");
+    return true;
   } catch (error) {
     if (error !== "cancel" && error !== "close")
       ElMessage.error(errorMessage(error));
+    return false;
+  }
+}
+async function removeHistoryFromPreview(item: HistoryRecord) {
+  if (await removeHistory(item)) {
+    isHistoryPreviewOpen.value = false;
+    historyPreviewItem.value = null;
+    historyPreviewDraft.value = null;
   }
 }
 function addCompany() {
@@ -2349,6 +2831,30 @@ function normalizeExpense(
         ),
     ),
     manualFields: value.manualFields ?? {},
+  };
+}
+function normalizeDraftForUse(value: Partial<Draft>): Draft {
+  const defaults = createDraft();
+  const expenses = (value.expenses ?? []).slice(0, MAX_EXPENSES);
+  return {
+    ...defaults,
+    ...value,
+    id: value.id ?? defaults.id,
+    label: value.label ?? "",
+    status: normalizeReimbursementStatus(value.status),
+    companyName: value.companyName ?? defaults.companyName,
+    reimbursementDate: value.reimbursementDate ?? "",
+    applicant: value.applicant ?? defaults.applicant,
+    department: value.department ?? defaults.department,
+    payeeName: value.payeeName ?? defaults.payeeName,
+    account: value.account ?? defaults.account,
+    bank: value.bank ?? defaults.bank,
+    totalOverrideCents: value.totalOverrideCents ?? null,
+    previewMode: value.previewMode === "double" ? "double" : "single",
+    expenses: expenses.map((item, index) =>
+      normalizeExpense(item, index, expenses.length),
+    ),
+    updatedAt: value.updatedAt ?? defaults.updatedAt,
   };
 }
 function normalizeOcrProfile(value: Partial<OcrProfile>): OcrProfile {
@@ -2771,7 +3277,38 @@ async function saveExportBytes(
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   return null;
 }
-async function exportExcel() {
+async function withTemporaryDraft<T>(
+  source: Draft,
+  callback: () => Promise<T>,
+) {
+  commitActiveEdit();
+  const current = cloneDraft();
+  const previousTab = activeTab.value;
+  const previousSelectedId = selectedId.value;
+  const previousSelectedAttachmentId = selectedAttachmentId.value;
+  suppressAutoSave = true;
+  try {
+    applyDraft(cloneDraft(source));
+    activeTab.value = "reimbursement";
+    await nextTick();
+    updateScale();
+    await nextTick();
+    return await callback();
+  } finally {
+    applyDraft(current);
+    selectedId.value = previousSelectedId;
+    selectedAttachmentId.value = previousSelectedAttachmentId;
+    activeTab.value = previousTab;
+    await nextTick();
+    updateScale();
+    suppressAutoSave = false;
+  }
+}
+async function exportExcel(sourceDraft?: Draft) {
+  if (sourceDraft) {
+    await withTemporaryDraft(sourceDraft, () => exportExcel());
+    return;
+  }
   commitActiveEdit();
   if (!draft.expenses.length)
     return ElMessage.warning("请先上传至少一张费用截图");
@@ -3055,7 +3592,7 @@ async function exportExcel() {
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       "xlsx",
     );
-    void persistDraft(false);
+    if (!suppressAutoSave) void persistDraft(false);
     ElMessage.success(path ? "Excel 已导出到：" + path : "Excel 已下载");
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : "Excel 导出失败");
@@ -3063,7 +3600,11 @@ async function exportExcel() {
     if (activeTab.value !== previousTab) activeTab.value = previousTab;
   }
 }
-async function exportPdf() {
+async function exportPdf(sourceDraft?: Draft) {
+  if (sourceDraft) {
+    await withTemporaryDraft(sourceDraft, () => exportPdf());
+    return;
+  }
   commitActiveEdit();
   if (!draft.expenses.length)
     return ElMessage.warning("请先上传至少一张费用截图");
@@ -3119,7 +3660,7 @@ async function exportPdf() {
       "application/pdf",
       "pdf",
     );
-    void persistDraft(false);
+    if (!suppressAutoSave) void persistDraft(false);
     ElMessage.success(path ? "PDF 已导出到：" + path : "PDF 已下载");
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : "PDF 导出失败");
@@ -3163,7 +3704,7 @@ function removeProfile(profile: Profile) {
 }
 
 function scheduleAutoSave() {
-  if (isLoadingWorkspace.value) return;
+  if (isLoadingWorkspace.value || suppressAutoSave) return;
   autoSaveRevision += 1;
   isSaved.value = false;
   saveText.value = "尚未保存";
@@ -3189,8 +3730,14 @@ watch(
   scheduleAutoSave,
   { deep: true },
 );
+watch([leftPanelWidth, historyViewMode], scheduleAutoSave);
 watch([historySearch, historyDate, historyStatus], () => {
   historyPage.value = 1;
+  historyFolderKey.value = "";
+});
+watch(historyViewMode, () => {
+  historyPage.value = 1;
+  historyFolderKey.value = "";
 });
 watch([requestSearch, requestService, requestStatus], () => {
   requestPage.value = 1;
@@ -3237,6 +3784,10 @@ onMounted(() => {
   window.addEventListener("wheel", adjustImageByWheel, { passive: false });
   window.addEventListener("wheel", adjustPreviewZoom, { passive: false });
   window.addEventListener("contextmenu", preventContextMenu);
+  window.addEventListener("keydown", handleGlobalKeydown);
+  window.addEventListener("pointerup", endPaperCellSelection);
+  window.addEventListener("pointermove", moveLeftPanelResize);
+  window.addEventListener("pointerup", stopLeftPanelResize);
 });
 onUnmounted(() => {
   if (saveTimer.value !== null) window.clearTimeout(saveTimer.value);
@@ -3255,6 +3806,10 @@ onUnmounted(() => {
   window.removeEventListener("wheel", adjustImageByWheel);
   window.removeEventListener("wheel", adjustPreviewZoom);
   window.removeEventListener("contextmenu", preventContextMenu);
+  window.removeEventListener("keydown", handleGlobalKeydown);
+  window.removeEventListener("pointerup", endPaperCellSelection);
+  window.removeEventListener("pointermove", moveLeftPanelResize);
+  window.removeEventListener("pointerup", stopLeftPanelResize);
 });
 </script>
 
@@ -3340,7 +3895,11 @@ onUnmounted(() => {
         >
       </div>
     </header>
-    <main v-if="activeTab === 'reimbursement'" class="workspace">
+    <main
+      v-if="activeTab === 'reimbursement'"
+      class="workspace"
+      :style="{ '--left-panel-width': `${leftPanelWidth}px` }"
+    >
       <aside
         class="left-panel"
         @pointerdown.capture="commitActiveEdit"
@@ -3504,9 +4063,10 @@ onUnmounted(() => {
                     :label="reason"
                     :value="reason" /></el-select
                 ><el-input
+                  class="expense-amount-field"
                   :model-value="amountInputValue(expense)"
                   inputmode="decimal"
-                  placeholder="金额"
+                  placeholder="金额或 =3+33*2"
                   @focus="beginAmountInput(expense)"
                   @update:model-value="
                     (value: string) => updateAmountInput(expense, value)
@@ -3517,6 +4077,7 @@ onUnmounted(() => {
                   "
                   ><template #prepend>￥</template></el-input
                 ><el-select
+                  class="expense-arranger-field"
                   v-model="expense.arranger"
                   placeholder="安排人"
                   @change="
@@ -3533,7 +4094,7 @@ onUnmounted(() => {
                   v-model="expense.description"
                   type="textarea"
                   :rows="2"
-                  class="expense-description-input"
+                  class="expense-description-field expense-description-input"
                   placeholder="内容说明"
                   @change="
                     expense.manualFields.description = true;
@@ -3619,6 +4180,13 @@ onUnmounted(() => {
           </div>
         </section>
       </aside>
+      <div
+        class="workspace-resizer"
+        role="separator"
+        aria-label="调整费用列表宽度"
+        title="拖动调整费用列表宽度"
+        @pointerdown="startLeftPanelResize"
+      />
       <section ref="previewViewport" class="preview-panel">
         <div class="preview-toolbar">
           <div>
@@ -3696,6 +4264,14 @@ onUnmounted(() => {
               title="重置当前图片排版"
               :disabled="!selectedAttachment"
               @click="resetImage"
+            />
+            <el-button
+              circle
+              text
+              :icon="CopyDocument"
+              title="复制选中的单元格"
+              :disabled="!cellSelection"
+              @click="copySelectedPaperCells"
             />
           </div>
         </div>
@@ -3776,7 +4352,9 @@ onUnmounted(() => {
                     <tbody>
                       <template v-if="formPage.rows.length"
                         ><tr
-                          v-for="{ expense, index, height } in formPage.rows"
+                          v-for="(
+                            { expense, index, height }, rowIndex
+                          ) in formPage.rows"
                           :key="expense.id"
                           :data-expense-id="expense.id"
                           :style="{ height: height + 'px' }"
@@ -3788,7 +4366,31 @@ onUnmounted(() => {
                           }"
                           @click="selectExpense(expense)"
                         >
-                          <td>
+                          <td
+                            :class="{
+                              'paper-cell-selected': isPaperCellSelected(
+                                formPageIndex,
+                                rowIndex,
+                                0,
+                              ),
+                            }"
+                            @pointerdown="
+                              startPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                0,
+                              )
+                            "
+                            @pointerenter="
+                              extendPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                0,
+                              )
+                            "
+                          >
                             <span class="paper-row-index">
                               <span
                                 class="paper-row-drag-handle"
@@ -3799,7 +4401,31 @@ onUnmounted(() => {
                               <span>{{ index + 1 }}</span>
                             </span>
                           </td>
-                          <td>
+                          <td
+                            :class="{
+                              'paper-cell-selected': isPaperCellSelected(
+                                formPageIndex,
+                                rowIndex,
+                                1,
+                              ),
+                            }"
+                            @pointerdown="
+                              startPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                1,
+                              )
+                            "
+                            @pointerenter="
+                              extendPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                1,
+                              )
+                            "
+                          >
                             <template
                               v-if="
                                 editingKey === fieldKey(expense, 'occurredDate')
@@ -3825,7 +4451,31 @@ onUnmounted(() => {
                               {{ expense.occurredDate }}
                             </button>
                           </td>
-                          <td>
+                          <td
+                            :class="{
+                              'paper-cell-selected': isPaperCellSelected(
+                                formPageIndex,
+                                rowIndex,
+                                2,
+                              ),
+                            }"
+                            @pointerdown="
+                              startPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                2,
+                              )
+                            "
+                            @pointerenter="
+                              extendPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                2,
+                              )
+                            "
+                          >
                             <template
                               v-if="editingKey === fieldKey(expense, 'reason')"
                               ><select
@@ -3856,7 +4506,32 @@ onUnmounted(() => {
                               {{ expense.reason }}
                             </button>
                           </td>
-                          <td class="description-cell">
+                          <td
+                            class="description-cell"
+                            :class="{
+                              'paper-cell-selected': isPaperCellSelected(
+                                formPageIndex,
+                                rowIndex,
+                                3,
+                              ),
+                            }"
+                            @pointerdown="
+                              startPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                3,
+                              )
+                            "
+                            @pointerenter="
+                              extendPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                3,
+                              )
+                            "
+                          >
                             <template
                               v-if="
                                 editingKey === fieldKey(expense, 'description')
@@ -3884,7 +4559,31 @@ onUnmounted(() => {
                               {{ expense.description || "xxxx" }}
                             </button>
                           </td>
-                          <td>
+                          <td
+                            :class="{
+                              'paper-cell-selected': isPaperCellSelected(
+                                formPageIndex,
+                                rowIndex,
+                                4,
+                              ),
+                            }"
+                            @pointerdown="
+                              startPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                4,
+                              )
+                            "
+                            @pointerenter="
+                              extendPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                4,
+                              )
+                            "
+                          >
                             <template
                               v-if="
                                 editingKey === fieldKey(expense, 'arranger')
@@ -3917,7 +4616,31 @@ onUnmounted(() => {
                               {{ expense.arranger }}
                             </button>
                           </td>
-                          <td>
+                          <td
+                            :class="{
+                              'paper-cell-selected': isPaperCellSelected(
+                                formPageIndex,
+                                rowIndex,
+                                5,
+                              ),
+                            }"
+                            @pointerdown="
+                              startPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                5,
+                              )
+                            "
+                            @pointerenter="
+                              extendPaperCellSelection(
+                                $event,
+                                formPageIndex,
+                                rowIndex,
+                                5,
+                              )
+                            "
+                          >
                             <template
                               v-if="
                                 editingKey === fieldKey(expense, 'amountCents')
@@ -3926,9 +4649,10 @@ onUnmounted(() => {
                                 ref="editInput"
                                 v-model="editValue"
                                 class="paper-cell-input amount-input"
-                                type="number"
-                                min="0"
-                                step="0.01"
+                                type="text"
+                                inputmode="decimal"
+                                autocomplete="off"
+                                placeholder="=3+33*2"
                                 @blur="commitExpense(expense, 'amountCents')"
                                 @keydown.enter.prevent="
                                   commitExpense(expense, 'amountCents')
@@ -3978,17 +4702,21 @@ onUnmounted(() => {
                         v-else
                         class="paper-edit-input total-number"
                         :value="(effectiveTotal / 100).toFixed(2)"
-                        type="number"
-                        min="0"
-                        step="0.01"
+                        type="text"
+                        inputmode="decimal"
+                        autocomplete="off"
                         @change="
                           (event) => {
-                            const amount = Number(
+                            const amount = amountExpressionToCents(
                               (event.target as HTMLInputElement).value,
                             );
-                            draft.totalOverrideCents = Number.isFinite(amount)
-                              ? Math.max(0, Math.round(amount * 100))
-                              : 0;
+                            if (amount === null) {
+                              ElMessage.warning(
+                                '金额表达式无法计算，请检查数字和运算符',
+                              );
+                              return;
+                            }
+                            draft.totalOverrideCents = amount;
                             dirty();
                           }
                         "
@@ -4780,70 +5508,260 @@ onUnmounted(() => {
             :value="status"
           />
         </el-select>
-        <span>{{ filteredHistory.length }} 条</span>
+        <el-radio-group v-model="historyViewMode" size="small">
+          <el-radio-button label="company">公司文件夹</el-radio-button>
+          <el-radio-button label="status">状态文件夹</el-radio-button>
+          <el-radio-button label="list">列表</el-radio-button>
+        </el-radio-group>
       </div>
       <div v-if="!filteredHistory.length" class="history-empty">
         <Clock :size="25" /><strong>还没有已保存的历史记录</strong
         ><span>点击“保存草稿”后，记录会保存在本机。</span>
       </div>
-      <div v-else class="history-list">
-        <article
-          v-for="item in pagedHistory"
-          :key="item.id"
-          class="history-item"
-          @click="restoreHistory(item)"
+      <template v-else>
+        <div
+          v-if="historyViewMode !== 'list' && !historyFolderKey"
+          class="history-folder-grid"
         >
-          <div class="history-item-main">
-            <div class="history-item-title">
-              <strong>{{ item.companyName || "未填写公司" }}</strong>
-              <span>{{ item.applicant || "未填写申请人" }}</span>
-              <el-tag v-if="item.label" size="small" effect="plain">{{
-                item.label
-              }}</el-tag>
-              <el-tag
-                v-if="item.id === lastEditedHistoryId"
-                size="small"
-                effect="plain"
-                type="primary"
-                >上次编辑</el-tag
-              >
-            </div>
-            <span
-              >{{ item.expenseCount }} 笔 · ￥{{ money(item.totalCents) }} ·
-              编辑于 {{ formatDateTime(item.updatedAt) }}</span
-            >
-            <small>{{ item.id }}</small>
+          <button
+            v-for="folder in historyFolders"
+            :key="folder.key"
+            type="button"
+            class="history-folder-card"
+            @click="openHistoryFolder(folder)"
+          >
+            <Folder :size="28" />
+            <strong>{{ folder.label }}</strong>
+            <span>{{ folder.count }} 条单据</span>
+            <small v-if="folder.deleted">设置中已删除</small>
+          </button>
+        </div>
+        <template v-else>
+          <div v-if="historyViewMode !== 'list'" class="history-breadcrumb">
+            <el-button text :icon="ArrowLeftBold" @click="leaveHistoryFolder"
+              >全部文件夹</el-button
+            ><span>/</span><strong>{{ historyCurrentFolder?.label }}</strong>
           </div>
-          <div class="history-item-actions">
-            <el-tag
-              class="history-status"
-              :type="reimbursementStatusType(item.status)"
-              effect="light"
-              title="点击切换报销状态"
-              @click.stop="cycleHistoryStatus(item)"
-              >{{ item.status }}</el-tag
+          <div v-if="!historyScopedRecords.length" class="history-empty">
+            <Clock :size="25" /><strong>当前筛选下没有单据</strong>
+          </div>
+          <div v-else class="history-list">
+            <article
+              v-for="item in pagedHistory"
+              :key="item.id"
+              class="history-item"
+              @click="openHistoryPreview(item)"
             >
-            <el-button
-              circle
-              text
-              type="danger"
-              :icon="Delete"
-              title="删除历史记录"
-              @click.stop="removeHistory(item)"
+              <div class="history-item-main">
+                <div class="history-item-title">
+                  <strong>{{ item.companyName || "未填写公司" }}</strong>
+                  <span>{{ item.applicant || "未填写申请人" }}</span>
+                  <el-tag v-if="item.label" size="small" effect="plain">{{
+                    item.label
+                  }}</el-tag>
+                  <el-tag
+                    v-if="item.id === lastEditedHistoryId"
+                    size="small"
+                    effect="plain"
+                    type="primary"
+                    >上次编辑</el-tag
+                  >
+                </div>
+                <strong class="history-occurred-date">{{
+                  item.firstOccurredDate || "未填写发生日期"
+                }}</strong>
+                <span
+                  >{{ item.expenseCount }} 笔 · ￥{{ money(item.totalCents) }} ·
+                  编辑于 {{ formatDateTime(item.updatedAt) }}</span
+                >
+                <small>{{ item.id }}</small>
+              </div>
+              <div class="history-item-actions">
+                <el-tag
+                  class="history-status"
+                  :type="reimbursementStatusType(item.status)"
+                  effect="light"
+                  title="点击切换报销状态"
+                  @click.stop="cycleHistoryStatus(item)"
+                  >{{ item.status }}</el-tag
+                >
+                <el-button
+                  circle
+                  text
+                  :icon="View"
+                  title="查看详情"
+                  @click.stop="openHistoryPreview(item)"
+                /><el-button
+                  circle
+                  text
+                  :icon="EditPen"
+                  title="修改"
+                  @click.stop="editHistory(item)"
+                /><el-button
+                  circle
+                  text
+                  :icon="Printer"
+                  title="打印"
+                  @click.stop="printHistory(item)"
+                /><el-dropdown trigger="click" @click.stop>
+                  <el-button circle text :icon="Download" title="导出" />
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item @click="exportHistoryExcel(item)">
+                        导出 Excel
+                      </el-dropdown-item>
+                      <el-dropdown-item @click="exportHistoryPdf(item)">
+                        导出 PDF
+                      </el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template> </el-dropdown
+                ><el-button
+                  circle
+                  text
+                  type="danger"
+                  :icon="Delete"
+                  title="删除历史记录"
+                  @click.stop="removeHistory(item)"
+                />
+              </div>
+            </article>
+          </div>
+          <div v-if="historyScopedRecords.length" class="history-pagination">
+            <el-pagination
+              v-model:current-page="historyPage"
+              v-model:page-size="historyPageSize"
+              background
+              layout="total, prev, pager, next"
+              :total="historyScopedRecords.length"
             />
           </div>
-        </article>
-      </div>
-      <div v-if="filteredHistory.length" class="history-pagination">
-        <el-pagination
-          v-model:current-page="historyPage"
-          v-model:page-size="historyPageSize"
-          background
-          layout="total, prev, pager, next"
-          :total="filteredHistory.length"
-        />
-      </div>
+        </template>
+      </template>
     </section>
+    <el-dialog
+      v-model="isHistoryPreviewOpen"
+      title="历史报销单详情"
+      width="980px"
+      destroy-on-close
+    >
+      <div v-loading="isHistoryPreviewLoading" class="history-preview-dialog">
+        <template v-if="historyPreviewDraft && historyPreviewItem">
+          <div class="history-preview-summary">
+            <div>
+              <span class="eyebrow">READ ONLY PREVIEW</span>
+              <h2>
+                {{ historyPreviewDraft.companyName || "未填写公司" }}费用报销单
+              </h2>
+              <p>
+                {{ historyPreviewItem.firstOccurredDate || "未填写发生日期" }} ·
+                {{ historyPreviewDraft.expenses.length }} 笔 · ￥{{
+                  money(historyPreviewItem.totalCents)
+                }}
+              </p>
+              <small class="history-preview-meta">
+                申请人：{{ historyPreviewDraft.applicant || "未填写" }} ·
+                所属部门：{{ historyPreviewDraft.department || "未填写" }} ·
+                报销日期：{{
+                  historyPreviewDraft.reimbursementDate || "未填写"
+                }}
+              </small>
+            </div>
+            <el-tag :type="reimbursementStatusType(historyPreviewItem.status)">
+              {{ historyPreviewItem.status }}
+            </el-tag>
+          </div>
+          <div class="history-preview-table-wrap">
+            <table class="history-preview-table">
+              <thead>
+                <tr>
+                  <th>序号</th>
+                  <th>发生日期</th>
+                  <th>事由</th>
+                  <th>内容说明、参与人员等</th>
+                  <th>安排人</th>
+                  <th>金额</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(expense, index) in historyPreviewDraft.expenses"
+                  :key="expense.id"
+                >
+                  <td>{{ index + 1 }}</td>
+                  <td>{{ expense.occurredDate }}</td>
+                  <td>{{ expense.reason }}</td>
+                  <td class="preview-description">
+                    {{ expense.description || "" }}
+                  </td>
+                  <td class="preview-description">{{ expense.arranger }}</td>
+                  <td>{{ money(expense.amountCents) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="history-preview-attachments">
+            <template
+              v-for="expense in historyPreviewDraft.expenses"
+              :key="expense.id"
+            >
+              <el-image
+                :src="expense.imageDataUrl"
+                fit="cover"
+                :preview-src-list="[expense.imageDataUrl]"
+              />
+              <el-image
+                v-for="attachment in expense.extraAttachments"
+                :key="attachment.id"
+                :src="attachment.imageDataUrl"
+                fit="cover"
+                :preview-src-list="[attachment.imageDataUrl]"
+              />
+            </template>
+          </div>
+        </template>
+      </div>
+      <template #footer>
+        <el-button @click="isHistoryPreviewOpen = false">关闭</el-button>
+        <el-button
+          v-if="historyPreviewItem"
+          :type="reimbursementStatusType(historyPreviewItem.status)"
+          @click="cycleHistoryStatus(historyPreviewItem)"
+          >切换状态</el-button
+        >
+        <el-button
+          v-if="historyPreviewItem"
+          :icon="Download"
+          @click="exportHistoryExcel(historyPreviewItem)"
+          >导出 Excel</el-button
+        >
+        <el-button
+          v-if="historyPreviewItem"
+          :icon="Printer"
+          @click="printHistory(historyPreviewItem)"
+          >打印</el-button
+        >
+        <el-button
+          v-if="historyPreviewItem"
+          :icon="CopyDocument"
+          @click="createFromHistoryTemplate(historyPreviewItem)"
+          >以此为模板新建</el-button
+        >
+        <el-button
+          v-if="historyPreviewItem"
+          type="danger"
+          :icon="Delete"
+          @click="removeHistoryFromPreview(historyPreviewItem)"
+          >删除</el-button
+        >
+        <el-button
+          v-if="historyPreviewItem"
+          type="primary"
+          :icon="EditPen"
+          @click="editHistory(historyPreviewItem)"
+          >修改</el-button
+        >
+      </template>
+    </el-dialog>
     <section v-if="activeTab === 'requests'" class="page-shell requests-page">
       <div class="page-heading">
         <div>
@@ -5178,7 +6096,25 @@ button {
   min-height: 0;
   flex: 1;
   display: grid;
-  grid-template-columns: 404px minmax(0, 1fr);
+  grid-template-columns: var(--left-panel-width, 404px) 8px minmax(0, 1fr);
+}
+.workspace-resizer {
+  position: relative;
+  z-index: 5;
+  cursor: col-resize;
+  touch-action: none;
+  background: #e1e8e3;
+}
+.workspace-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.workspace-resizer:hover::after,
+.workspace-resizer:active::after {
+  background: #cf674d;
 }
 .left-panel {
   min-height: calc(100vh - 70px);
@@ -5607,6 +6543,11 @@ h3 {
 .paper-table tr.dragging-row td {
   background: #f6e9e4;
 }
+.paper-table td.paper-cell-selected {
+  background: #dceeff !important;
+  box-shadow: inset 0 0 0 1px #6aa8d8;
+  user-select: text;
+}
 .paper-table .empty-row td {
   color: #a7afa9;
 }
@@ -5648,14 +6589,13 @@ h3 {
   outline: 1px dashed #d99a89;
 }
 .description-button {
-  display: -webkit-box;
+  display: block;
   width: 100%;
-  overflow: hidden;
+  overflow: visible;
   text-align: left;
   line-height: 1.3;
-  white-space: normal;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .amount-button {
   width: 100%;
@@ -6059,6 +6999,160 @@ h3 {
   gap: 8px;
   margin-top: 15px;
 }
+.history-folder-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.history-folder-card {
+  min-height: 132px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid #dce6df;
+  border-radius: 8px;
+  color: #4f665b;
+  background: #fbfcfa;
+  text-align: left;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s,
+    transform 0.15s;
+}
+.history-folder-card:hover {
+  border-color: #cf674d;
+  box-shadow: 0 7px 16px rgba(42, 61, 53, 0.08);
+  transform: translateY(-1px);
+}
+.history-folder-card svg {
+  color: #c47a5f;
+}
+.history-folder-card strong {
+  max-width: 100%;
+  overflow: hidden;
+  color: #3f5149;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-folder-card span,
+.history-folder-card small {
+  color: #89968f;
+  font-size: 11px;
+}
+.history-folder-card small {
+  color: #b45d47;
+}
+.history-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 13px;
+  color: #839189;
+  font-size: 12px;
+}
+.history-breadcrumb .el-button {
+  margin: 0;
+}
+.history-occurred-date {
+  color: #33483e !important;
+  font-size: 16px !important;
+  font-weight: 800 !important;
+  letter-spacing: 0;
+}
+.history-preview-dialog {
+  min-height: 260px;
+}
+.history-preview-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 13px;
+  border-bottom: 1px solid #e1e8e3;
+}
+.history-preview-summary h2 {
+  margin-top: 5px;
+  font-size: 18px;
+}
+.history-preview-summary p {
+  margin-top: 5px;
+  color: #7d8b84;
+  font-size: 11px;
+}
+.history-preview-meta {
+  display: block;
+  margin-top: 6px;
+  color: #8a9790;
+  font-size: 11px;
+}
+.history-preview-table-wrap {
+  max-height: 340px;
+  margin-top: 14px;
+  overflow: auto;
+  border: 1px solid #d7e1da;
+}
+.history-preview-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  color: #35483f;
+  font-size: 12px;
+}
+.history-preview-table th,
+.history-preview-table td {
+  min-height: 36px;
+  padding: 7px 8px;
+  border: 1px solid #d7e1da;
+  text-align: center;
+  vertical-align: middle;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.history-preview-table th {
+  background: #f1f6f2;
+  font-weight: 700;
+}
+.history-preview-table th:nth-child(1) {
+  width: 8%;
+}
+.history-preview-table th:nth-child(2) {
+  width: 14%;
+}
+.history-preview-table th:nth-child(3) {
+  width: 14%;
+}
+.history-preview-table th:nth-child(4) {
+  width: 32%;
+}
+.history-preview-table th:nth-child(5) {
+  width: 16%;
+}
+.history-preview-table th:nth-child(6) {
+  width: 16%;
+}
+.history-preview-table .preview-description {
+  text-align: left;
+}
+.history-preview-attachments {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(82px, 1fr));
+  gap: 8px;
+  max-height: 150px;
+  margin-top: 14px;
+  overflow: auto;
+}
+.history-preview-attachments .el-image {
+  width: 82px;
+  height: 82px;
+  border: 1px solid #d7e1da;
+  border-radius: 5px;
+  background: #f1f4f1;
+}
 .history-item {
   display: flex;
   align-items: center;
@@ -6298,6 +7392,7 @@ h3 {
   }
   .topbar,
   .left-panel,
+  .workspace-resizer,
   .preview-toolbar,
   .image-inspector,
   .el-overlay,
@@ -6856,7 +7951,9 @@ h3 {
 .expense-mini-fields > * {
   min-width: 0;
 }
-.expense-mini-fields > :nth-child(5) {
+.expense-mini-fields > .expense-amount-field,
+.expense-mini-fields > .expense-arranger-field,
+.expense-mini-fields > .expense-description-field {
   grid-column: 1 / -1;
 }
 .expense-description-input .el-textarea__inner {

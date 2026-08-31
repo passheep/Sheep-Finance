@@ -18,6 +18,8 @@ pub struct SaveWorkspaceRequest {
     pub dictionaries: Value,
     pub services: Value,
     pub history: Value,
+    #[serde(default)]
+    pub ui_preferences: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -28,6 +30,8 @@ pub struct LoadedWorkspace {
     pub dictionaries: Value,
     pub services: Value,
     pub history: Value,
+    #[serde(default)]
+    pub ui_preferences: Value,
     pub data_directory: String,
 }
 
@@ -39,6 +43,8 @@ struct WorkspaceIndex {
     dictionaries: Value,
     services: Value,
     history: Value,
+    #[serde(default)]
+    ui_preferences: Value,
 }
 
 #[tauri::command]
@@ -107,6 +113,7 @@ fn save_workspace_blocking(root: &Path, request: SaveWorkspaceRequest) -> Result
         dictionaries: request.dictionaries,
         services: request.services,
         history: request.history,
+        ui_preferences: request.ui_preferences,
     };
     write_json_atomic(&root.join("workspace.json"), &index)
 }
@@ -134,6 +141,7 @@ fn load_workspace_blocking(root: &Path) -> Result<Option<LoadedWorkspace>, Strin
         dictionaries: index.dictionaries,
         services: index.services,
         history: index.history,
+        ui_preferences: index.ui_preferences,
         data_directory: root.to_string_lossy().into_owned(),
     }))
 }
@@ -215,6 +223,19 @@ mod tests {
         assert!(validate_record_id("record-123_ab").is_ok());
         assert!(validate_record_id("../workspace").is_err());
         assert!(validate_record_id("C:\\temp").is_err());
+    }
+
+    #[test]
+    fn workspace_index_without_ui_preferences_is_compatible() {
+        let index: WorkspaceIndex = serde_json::from_value(serde_json::json!({
+            "currentRecordId": "record-1",
+            "profiles": [],
+            "dictionaries": {},
+            "services": {},
+            "history": []
+        }))
+        .expect("legacy workspace index");
+        assert!(index.ui_preferences.is_null());
     }
 
     #[test]
