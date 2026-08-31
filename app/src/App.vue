@@ -53,6 +53,7 @@ type OcrStatus =
 type AppTab = "reimbursement" | "history" | "requests" | "settings" | "about";
 type PreviewMode = "single" | "double";
 type HistoryViewMode = "company" | "status" | "list";
+type DictionaryType = "company" | "reason" | "arranger";
 type ReimbursementStatus = "未报销" | "报销中" | "已报销";
 type ExpenseEditableField =
   "occurredDate" | "reason" | "description" | "arranger" | "amountCents";
@@ -395,7 +396,7 @@ function createDraft(): Draft {
     id: id("record"),
     label: "",
     status: "未报销",
-    companyName: defaultCompany.value || companyNames.value[0] || "",
+    companyName: "",
     reimbursementDate: "",
     applicant: profile?.applicant ?? "",
     department: profile?.department ?? "",
@@ -501,6 +502,11 @@ const pointerState = ref<{
 const expenseDragState = ref<{
   id: string;
   surface: "list" | "paper";
+} | null>(null);
+const dictionaryDragState = ref<{
+  type: DictionaryType;
+  value: string;
+  pointerId: number;
 } | null>(null);
 
 const extraUploadExpense = computed(
@@ -1136,8 +1142,21 @@ function applyRecognizedField<
     return;
   expense[field] = value;
 }
+function clearUnconfirmedExpenseFields(expense: Expense) {
+  let changed = false;
+  if (!expense.manualFields.reason && expense.reason) {
+    expense.reason = "";
+    changed = true;
+  }
+  if (!expense.manualFields.arranger && expense.arranger) {
+    expense.arranger = "";
+    changed = true;
+  }
+  return changed;
+}
 async function recognizeExpense(expense: Expense, notify = true) {
   if (expense.ocrStatus === "recognizing") return;
+  if (clearUnconfirmedExpenseFields(expense)) dirty();
   if (!isTauriRuntime()) {
     expense.ocrStatus = "queued";
     expense.recognitionError = "OCR/大模型请求仅在桌面应用中运行";
@@ -1228,6 +1247,8 @@ async function recognizeExpense(expense: Expense, notify = true) {
         "amountCents",
         result.extracted.amountCents,
       );
+      // 事由和安排人必须人工确认，避免识别或字典默认值被直接带入单据。
+      clearUnconfirmedExpenseFields(current);
     }
     current.recognitionError = result.llmError ?? "";
     current.ocrStatus = result.llmError ? "partial" : "success";
@@ -1236,7 +1257,7 @@ async function recognizeExpense(expense: Expense, notify = true) {
       ElMessage.success(
         result.llmError
           ? "OCR 已完成，大模型提取失败，可查看原文后手工填写"
-          : "识别完成，已填入未被人工修改的字段",
+          : "识别完成，请人工确认事由和安排人",
       );
   } catch (error) {
     const current = draft.expenses.find((item) => item.id === expense.id);
@@ -1966,6 +1987,94 @@ function expenseDragMove(event: PointerEvent) {
 function expenseDragStop() {
   expenseDragState.value = null;
 }
+function dictionaryValues(type: DictionaryType) {
+  if (type === "company") return companyNames.value;
+  if (type === "reason") return expenseReasons.value;
+  return arrangers.value;
+}
+function setDictionaryValues(type: DictionaryType, values: string[]) {
+  if (type === "company") companyNames.value = values;
+  else if (type === "reason") expenseReasons.value = values;
+  else arrangers.value = values;
+}
+function reorderDictionary(
+  type: DictionaryType,
+  sourceValue: string,
+  targetIndex: number,
+) {
+  const values = dictionaryValues(type);
+  const sourceIndex = values.indexOf(sourceValue);
+  if (sourceIndex < 0) return;
+  const remaining = values.filter((value) => value !== sourceValue);
+  const insertIndex = Math.max(0, Math.min(targetIndex, remaining.length));
+  const next = [
+    ...remaining.slice(0, insertIndex),
+    sourceValue,
+    ...remaining.slice(insertIndex),
+  ];
+  if (next.every((value, index) => value === values[index])) return;
+  setDictionaryValues(type, next);
+  dirty();
+}
+function startDictionaryDrag(
+  event: PointerEvent,
+  type: DictionaryType,
+  value: string,
+) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  dictionaryDragState.value = {
+    type,
+    value,
+    pointerId: event.pointerId,
+  };
+  document.body.style.userSelect = "none";
+  (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(
+    event.pointerId,
+  );
+}
+function isDictionaryDragging(type: DictionaryType, value: string) {
+  const state = dictionaryDragState.value;
+  return state?.type === type && state.value === value;
+}
+function moveDictionaryDrag(event: PointerEvent) {
+  const state = dictionaryDragState.value;
+  if (!state) return;
+  if (event.pointerId !== state.pointerId) return;
+  if (!(event.buttons & 1)) {
+    stopDictionaryDrag(event);
+    return;
+  }
+  event.preventDefault();
+  const container = document.querySelector<HTMLElement>(
+    `.dictionary-options[data-dictionary-type="${state.type}"]`,
+  );
+  if (!container) return;
+  const options = Array.from(
+    container.querySelectorAll<HTMLElement>(".dictionary-option"),
+  ).filter((option) => option.dataset.dictionaryValue !== state.value);
+  if (!options.length) return;
+  let insertIndex = options.length;
+  options.some((option, index) => {
+    const rect = option.getBoundingClientRect();
+    const centerY = rect.top + rect.height / 2;
+    const centerX = rect.left + rect.width / 2;
+    const sameRow = Math.abs(event.clientY - centerY) <= rect.height / 2;
+    if (event.clientY < centerY || (sameRow && event.clientX < centerX)) {
+      insertIndex = index;
+      return true;
+    }
+    return false;
+  });
+  reorderDictionary(state.type, state.value, insertIndex);
+}
+function stopDictionaryDrag(event?: PointerEvent) {
+  const state = dictionaryDragState.value;
+  if (!state || (event && event.pointerId !== state.pointerId)) return;
+  dictionaryDragState.value = null;
+  document.body.style.userSelect = "";
+}
 function updateScale() {
   if (!leftPanelResizeState.value)
     leftPanelWidth.value = clampLeftPanelWidth(leftPanelWidth.value);
@@ -2503,6 +2612,7 @@ async function createFromHistoryTemplate(item: HistoryRecord) {
     const template = await loadHistoryDraft(item);
     const created = cloneDraft(template);
     created.id = id("record");
+    created.companyName = "";
     created.label = template.label
       ? `${template.label} - 副本`
       : `${template.companyName || "报销单"} - 副本`;
@@ -2839,7 +2949,7 @@ function normalizeDraftForUse(value: Partial<Draft>): Draft {
     id: value.id ?? defaults.id,
     label: value.label ?? "",
     status: normalizeReimbursementStatus(value.status),
-    companyName: value.companyName ?? defaults.companyName,
+    companyName: value.companyName ?? "",
     reimbursementDate: value.reimbursementDate ?? "",
     applicant: value.applicant ?? defaults.applicant,
     department: value.department ?? defaults.department,
@@ -3776,8 +3886,11 @@ onMounted(() => {
   window.addEventListener("pointerdown", expenseDragStart);
   window.addEventListener("pointermove", pointerMove);
   window.addEventListener("pointermove", expenseDragMove);
+  window.addEventListener("pointermove", moveDictionaryDrag);
   window.addEventListener("pointerup", pointerStop);
   window.addEventListener("pointerup", expenseDragStop);
+  window.addEventListener("pointerup", stopDictionaryDrag);
+  window.addEventListener("pointercancel", stopDictionaryDrag);
   window.addEventListener("wheel", adjustImageByWheel, { passive: false });
   window.addEventListener("wheel", adjustPreviewZoom, { passive: false });
   window.addEventListener("contextmenu", preventContextMenu);
@@ -3798,8 +3911,11 @@ onUnmounted(() => {
   window.removeEventListener("pointerdown", expenseDragStart);
   window.removeEventListener("pointermove", pointerMove);
   window.removeEventListener("pointermove", expenseDragMove);
+  window.removeEventListener("pointermove", moveDictionaryDrag);
   window.removeEventListener("pointerup", pointerStop);
   window.removeEventListener("pointerup", expenseDragStop);
+  window.removeEventListener("pointerup", stopDictionaryDrag);
+  window.removeEventListener("pointercancel", stopDictionaryDrag);
   window.removeEventListener("wheel", adjustImageByWheel);
   window.removeEventListener("wheel", adjustPreviewZoom);
   window.removeEventListener("contextmenu", preventContextMenu);
@@ -5347,7 +5463,7 @@ onUnmounted(() => {
             </div>
           </div>
           <p class="drawer-help">
-            选中的默认值会自动带入新建报销单或新上传的费用。
+            拖动每项左侧的排序图标调整顺序；选中的默认值会自动带入新上传的费用。
           </p>
           <p class="drawer-help configuration-transfer-help">
             导出的 TXT 会进行轻量加密，可在另一台 SheepFinance
@@ -5357,11 +5473,23 @@ onUnmounted(() => {
             <h4>公司名称字典</h4>
             <div class="dictionary-options">
               <div
-                v-for="company in companyNames"
+                v-for="(company, index) in companyNames"
                 :key="company"
                 class="dictionary-option"
-                :class="{ default: company === defaultCompany }"
+                :class="{
+                  default: company === defaultCompany,
+                  dragging: isDictionaryDragging('company', company),
+                }"
+                data-dictionary-type="company"
+                :data-dictionary-index="index"
+                :data-dictionary-value="company"
               >
+                <span
+                  class="dictionary-drag-handle"
+                  title="按住拖动调整顺序"
+                  @pointerdown="startDictionaryDrag($event, 'company', company)"
+                  ><Sort :size="14"
+                /></span>
                 <el-radio
                   :model-value="defaultCompany"
                   :value="company"
@@ -5397,11 +5525,23 @@ onUnmounted(() => {
             <h4>事由字典</h4>
             <div class="dictionary-options">
               <div
-                v-for="reason in expenseReasons"
+                v-for="(reason, index) in expenseReasons"
                 :key="reason"
                 class="dictionary-option"
-                :class="{ default: reason === defaultReason }"
+                :class="{
+                  default: reason === defaultReason,
+                  dragging: isDictionaryDragging('reason', reason),
+                }"
+                data-dictionary-type="reason"
+                :data-dictionary-index="index"
+                :data-dictionary-value="reason"
               >
+                <span
+                  class="dictionary-drag-handle"
+                  title="按住拖动调整顺序"
+                  @pointerdown="startDictionaryDrag($event, 'reason', reason)"
+                  ><Sort :size="14"
+                /></span>
                 <el-radio
                   :model-value="defaultReason"
                   :value="reason"
@@ -5437,11 +5577,25 @@ onUnmounted(() => {
             <h4>安排人字典</h4>
             <div class="dictionary-options">
               <div
-                v-for="arranger in arrangers"
+                v-for="(arranger, index) in arrangers"
                 :key="arranger"
                 class="dictionary-option"
-                :class="{ default: arranger === defaultArranger }"
+                :class="{
+                  default: arranger === defaultArranger,
+                  dragging: isDictionaryDragging('arranger', arranger),
+                }"
+                data-dictionary-type="arranger"
+                :data-dictionary-index="index"
+                :data-dictionary-value="arranger"
               >
+                <span
+                  class="dictionary-drag-handle"
+                  title="按住拖动调整顺序"
+                  @pointerdown="
+                    startDictionaryDrag($event, 'arranger', arranger)
+                  "
+                  ><Sort :size="14"
+                /></span>
                 <el-radio
                   :model-value="defaultArranger"
                   :value="arranger"
@@ -8318,9 +8472,29 @@ h3 {
   border-radius: 7px;
   background: #fbfcfa;
 }
+.dictionary-drag-handle {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 18px;
+  color: #9eaaa4;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.dictionary-drag-handle:active {
+  cursor: grabbing;
+}
 .dictionary-option.default {
   border-color: #9bc7b3;
   background: #f4faf7;
+}
+.dictionary-option.dragging {
+  opacity: 0.72;
+  border-color: #cf674d;
+  box-shadow: 0 8px 18px rgba(42, 61, 53, 0.12);
 }
 .dictionary-option .el-radio {
   min-width: 0;
