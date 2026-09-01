@@ -171,9 +171,10 @@ interface HistoryFolder {
 }
 interface CellSelection {
   recordId: string;
-  columnIndex: number;
   startRow: number;
   endRow: number;
+  startColumn: number;
+  endColumn: number;
 }
 interface OcrProfile {
   id: string;
@@ -508,6 +509,20 @@ const dictionaryDragState = ref<{
   value: string;
   pointerId: number;
 } | null>(null);
+const dictionaryDropTarget = ref<{
+  type: DictionaryType;
+  value: string;
+  placement: "before" | "after";
+} | null>(null);
+const paperCellPointerState = ref<{
+  pointerId: number;
+  startX: number;
+  startY: number;
+  startRow: number;
+  startColumn: number;
+  dragged: boolean;
+} | null>(null);
+let suppressPaperCellClick = false;
 
 const extraUploadExpense = computed(
   () =>
@@ -1291,6 +1306,53 @@ function paperCellValue(expense: Expense, columnIndex: number) {
     ][columnIndex] ?? ""
   );
 }
+function paperCellField(columnIndex: number): ExpenseEditableField | null {
+  return ([
+    null,
+    "occurredDate",
+    "reason",
+    "description",
+    "arranger",
+    "amountCents",
+  ][columnIndex] ?? null) as ExpenseEditableField | null;
+}
+function openPaperCellEditor(expense: Expense, columnIndex: number) {
+  const field = paperCellField(columnIndex);
+  if (!field) return;
+  const value =
+    field === "amountCents"
+      ? (expense.amountCents / 100).toFixed(2)
+      : String(expense[field] ?? "");
+  beginEdit(fieldKey(expense, field), value);
+  if (field !== "reason" && field !== "arranger") return;
+  void nextTick(() => {
+    const select = editInput.value;
+    if (!(select instanceof HTMLSelectElement)) return;
+    select.focus();
+    try {
+      (
+        select as HTMLSelectElement & {
+          showPicker?: () => void;
+        }
+      ).showPicker?.();
+    } catch {
+      /* 旧版 WebView2 聚焦后仍可手动展开 */
+    }
+  });
+}
+function handlePaperCellClick(
+  event: MouseEvent,
+  expense: Expense,
+  columnIndex: number,
+) {
+  if (
+    event.target instanceof Element &&
+    event.target.closest("input, textarea, select, .paper-row-drag-handle")
+  )
+    return;
+  if (suppressPaperCellClick) return;
+  openPaperCellEditor(expense, columnIndex);
+}
 function isPaperCellSelected(
   pageIndex: number,
   rowIndex: number,
@@ -1298,15 +1360,17 @@ function isPaperCellSelected(
 ) {
   const selection = cellSelection.value;
   const row = formPages.value[pageIndex]?.rows[rowIndex];
-  if (
-    !selection ||
-    selection.recordId !== draft.id ||
-    selection.columnIndex !== columnIndex
-  )
-    return false;
-  const start = Math.min(selection.startRow, selection.endRow);
-  const end = Math.max(selection.startRow, selection.endRow);
-  return row ? row.index >= start && row.index <= end : false;
+  if (!selection || selection.recordId !== draft.id || !row) return false;
+  const startRow = Math.min(selection.startRow, selection.endRow);
+  const endRow = Math.max(selection.startRow, selection.endRow);
+  const startColumn = Math.min(selection.startColumn, selection.endColumn);
+  const endColumn = Math.max(selection.startColumn, selection.endColumn);
+  return (
+    row.index >= startRow &&
+    row.index <= endRow &&
+    columnIndex >= startColumn &&
+    columnIndex <= endColumn
+  );
 }
 function startPaperCellSelection(
   event: PointerEvent,
@@ -1317,20 +1381,38 @@ function startPaperCellSelection(
   if (event.button !== 0 || !(event.target instanceof Element)) return;
   if (event.target.closest("input, textarea, select, .paper-row-drag-handle"))
     return;
-  const interactive = event.target.closest("button");
-  if (!interactive) {
-    event.preventDefault();
-    event.stopPropagation();
-  }
+  event.preventDefault();
+  event.stopPropagation();
   commitActiveEdit();
+  window.getSelection()?.removeAllRanges();
   document.body.style.userSelect = "none";
   const row = formPages.value[pageIndex]?.rows[rowIndex];
+  if (!row) return;
+  selectExpense(row.expense);
+  paperCellPointerState.value = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    startRow: row.index,
+    startColumn: columnIndex,
+    dragged: false,
+  };
   cellSelection.value = {
     recordId: draft.id,
-    columnIndex,
-    startRow: row?.index ?? rowIndex,
-    endRow: row?.index ?? rowIndex,
+    startRow: row.index,
+    endRow: row.index,
+    startColumn: columnIndex,
+    endColumn: columnIndex,
   };
+}
+function trackPaperCellSelection(event: PointerEvent) {
+  const state = paperCellPointerState.value;
+  if (!state || state.pointerId !== event.pointerId) return;
+  if (
+    Math.abs(event.clientX - state.startX) >= 4 ||
+    Math.abs(event.clientY - state.startY) >= 4
+  )
+    state.dragged = true;
 }
 function extendPaperCellSelection(
   event: PointerEvent,
@@ -1339,35 +1421,73 @@ function extendPaperCellSelection(
   columnIndex: number,
 ) {
   const selection = cellSelection.value;
+  const state = paperCellPointerState.value;
   if (!(event.buttons & 1)) return;
   const row = formPages.value[pageIndex]?.rows[rowIndex];
   if (
     !selection ||
     selection.recordId !== draft.id ||
-    selection.columnIndex !== columnIndex ||
+    !state ||
+    state.pointerId !== event.pointerId ||
     !row
   )
     return;
   event.preventDefault();
   event.stopPropagation();
   selection.endRow = row.index;
+  selection.endColumn = columnIndex;
+  if (row.index !== state.startRow || columnIndex !== state.startColumn)
+    state.dragged = true;
 }
-function endPaperCellSelection() {
-  if (cellSelection.value) document.body.style.userSelect = "";
+function finishPaperCellSelection(event: PointerEvent, canceled = false) {
+  const state = paperCellPointerState.value;
+  if (!state || state.pointerId !== event.pointerId) return;
+  paperCellPointerState.value = null;
+  document.body.style.userSelect = "";
+  window.getSelection()?.removeAllRanges();
+  suppressPaperCellClick = true;
+  window.setTimeout(() => {
+    suppressPaperCellClick = false;
+  });
+  if (canceled || state.dragged) return;
+  const expense = draft.expenses[state.startRow];
+  if (expense) openPaperCellEditor(expense, state.startColumn);
+}
+function endPaperCellSelection(event: PointerEvent) {
+  finishPaperCellSelection(event);
+}
+function cancelPaperCellSelection(event: PointerEvent) {
+  finishPaperCellSelection(event, true);
+}
+function clipboardCellValue(value: string) {
+  return /["\t\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
 }
 function selectedPaperCellText() {
   const selection = cellSelection.value;
-  if (!selection || selection.recordId !== draft.id) return "";
-  const start = Math.min(selection.startRow, selection.endRow);
-  const end = Math.max(selection.startRow, selection.endRow);
-  return draft.expenses
-    .slice(start, end + 1)
-    .map((expense) => paperCellValue(expense, selection.columnIndex))
-    .join("\n");
+  if (!selection || selection.recordId !== draft.id) return null;
+  const startRow = Math.min(selection.startRow, selection.endRow);
+  const endRow = Math.max(selection.startRow, selection.endRow);
+  const startColumn = Math.min(selection.startColumn, selection.endColumn);
+  const endColumn = Math.max(selection.startColumn, selection.endColumn);
+  const rows: string[] = [];
+  for (let rowIndex = startRow; rowIndex <= endRow; rowIndex += 1) {
+    const expense = draft.expenses[rowIndex];
+    if (!expense) continue;
+    const columns: string[] = [];
+    for (
+      let columnIndex = startColumn;
+      columnIndex <= endColumn;
+      columnIndex += 1
+    ) {
+      columns.push(clipboardCellValue(paperCellValue(expense, columnIndex)));
+    }
+    rows.push(columns.join("\t"));
+  }
+  return rows.join("\r\n");
 }
 async function copySelectedPaperCells() {
   const value = selectedPaperCellText();
-  if (!value) return ElMessage.info("请先拖动选中要复制的单元格");
+  if (value === null) return ElMessage.info("请先拖动选中要复制的单元格");
   try {
     await navigator.clipboard.writeText(value);
   } catch {
@@ -2000,18 +2120,17 @@ function setDictionaryValues(type: DictionaryType, values: string[]) {
 function reorderDictionary(
   type: DictionaryType,
   sourceValue: string,
-  targetIndex: number,
+  targetValue: string,
+  placement: "before" | "after",
 ) {
   const values = dictionaryValues(type);
   const sourceIndex = values.indexOf(sourceValue);
-  if (sourceIndex < 0) return;
-  const remaining = values.filter((value) => value !== sourceValue);
-  const insertIndex = Math.max(0, Math.min(targetIndex, remaining.length));
-  const next = [
-    ...remaining.slice(0, insertIndex),
-    sourceValue,
-    ...remaining.slice(insertIndex),
-  ];
+  if (sourceIndex < 0 || sourceValue === targetValue) return;
+  const next = [...values];
+  next.splice(sourceIndex, 1);
+  const targetIndex = next.indexOf(targetValue);
+  if (targetIndex < 0) return;
+  next.splice(targetIndex + (placement === "after" ? 1 : 0), 0, sourceValue);
   if (next.every((value, index) => value === values[index])) return;
   setDictionaryValues(type, next);
   dirty();
@@ -2022,6 +2141,12 @@ function startDictionaryDrag(
   value: string,
 ) {
   if (event.button !== 0) return;
+  if (
+    event.target instanceof Element &&
+    event.target.closest("button, input, label.el-radio") &&
+    !event.target.closest(".dictionary-drag-handle")
+  )
+    return;
   event.preventDefault();
   event.stopPropagation();
   dictionaryDragState.value = {
@@ -2038,6 +2163,18 @@ function isDictionaryDragging(type: DictionaryType, value: string) {
   const state = dictionaryDragState.value;
   return state?.type === type && state.value === value;
 }
+function isDictionaryDropTarget(
+  type: DictionaryType,
+  value: string,
+  placement: "before" | "after",
+) {
+  const target = dictionaryDropTarget.value;
+  return (
+    target?.type === type &&
+    target.value === value &&
+    target.placement === placement
+  );
+}
 function moveDictionaryDrag(event: PointerEvent) {
   const state = dictionaryDragState.value;
   if (!state) return;
@@ -2050,29 +2187,35 @@ function moveDictionaryDrag(event: PointerEvent) {
   const container = document.querySelector<HTMLElement>(
     `.dictionary-options[data-dictionary-type="${state.type}"]`,
   );
-  if (!container) return;
-  const options = Array.from(
-    container.querySelectorAll<HTMLElement>(".dictionary-option"),
-  ).filter((option) => option.dataset.dictionaryValue !== state.value);
-  if (!options.length) return;
-  let insertIndex = options.length;
-  options.some((option, index) => {
-    const rect = option.getBoundingClientRect();
-    const centerY = rect.top + rect.height / 2;
-    const centerX = rect.left + rect.width / 2;
-    const sameRow = Math.abs(event.clientY - centerY) <= rect.height / 2;
-    if (event.clientY < centerY || (sameRow && event.clientX < centerX)) {
-      insertIndex = index;
-      return true;
-    }
-    return false;
-  });
-  reorderDictionary(state.type, state.value, insertIndex);
+  const target = document
+    .elementFromPoint(event.clientX, event.clientY)
+    ?.closest<HTMLElement>(".dictionary-option");
+  const targetValue = target?.dataset.dictionaryValue;
+  if (
+    !container ||
+    !target ||
+    !container.contains(target) ||
+    !targetValue ||
+    targetValue === state.value
+  ) {
+    dictionaryDropTarget.value = null;
+    return;
+  }
+  const rect = target.getBoundingClientRect();
+  const placement =
+    event.clientX < rect.left + rect.width / 2 ? "before" : "after";
+  dictionaryDropTarget.value = {
+    type: state.type,
+    value: targetValue,
+    placement,
+  };
+  reorderDictionary(state.type, state.value, targetValue, placement);
 }
 function stopDictionaryDrag(event?: PointerEvent) {
   const state = dictionaryDragState.value;
   if (!state || (event && event.pointerId !== state.pointerId)) return;
   dictionaryDragState.value = null;
+  dictionaryDropTarget.value = null;
   document.body.style.userSelect = "";
 }
 function updateScale() {
@@ -3887,6 +4030,7 @@ onMounted(() => {
   window.addEventListener("pointermove", pointerMove);
   window.addEventListener("pointermove", expenseDragMove);
   window.addEventListener("pointermove", moveDictionaryDrag);
+  window.addEventListener("pointermove", trackPaperCellSelection);
   window.addEventListener("pointerup", pointerStop);
   window.addEventListener("pointerup", expenseDragStop);
   window.addEventListener("pointerup", stopDictionaryDrag);
@@ -3896,6 +4040,7 @@ onMounted(() => {
   window.addEventListener("contextmenu", preventContextMenu);
   window.addEventListener("keydown", handleGlobalKeydown);
   window.addEventListener("pointerup", endPaperCellSelection);
+  window.addEventListener("pointercancel", cancelPaperCellSelection);
   window.addEventListener("pointermove", moveLeftPanelResize);
   window.addEventListener("pointerup", stopLeftPanelResize);
 });
@@ -3912,6 +4057,7 @@ onUnmounted(() => {
   window.removeEventListener("pointermove", pointerMove);
   window.removeEventListener("pointermove", expenseDragMove);
   window.removeEventListener("pointermove", moveDictionaryDrag);
+  window.removeEventListener("pointermove", trackPaperCellSelection);
   window.removeEventListener("pointerup", pointerStop);
   window.removeEventListener("pointerup", expenseDragStop);
   window.removeEventListener("pointerup", stopDictionaryDrag);
@@ -3921,6 +4067,7 @@ onUnmounted(() => {
   window.removeEventListener("contextmenu", preventContextMenu);
   window.removeEventListener("keydown", handleGlobalKeydown);
   window.removeEventListener("pointerup", endPaperCellSelection);
+  window.removeEventListener("pointercancel", cancelPaperCellSelection);
   window.removeEventListener("pointermove", moveLeftPanelResize);
   window.removeEventListener("pointerup", stopLeftPanelResize);
 });
@@ -4503,6 +4650,9 @@ onUnmounted(() => {
                                 0,
                               )
                             "
+                            @click.stop="
+                              handlePaperCellClick($event, expense, 0)
+                            "
                           >
                             <span class="paper-row-index">
                               <span
@@ -4538,6 +4688,9 @@ onUnmounted(() => {
                                 1,
                               )
                             "
+                            @click.stop="
+                              handlePaperCellClick($event, expense, 1)
+                            "
                           >
                             <template
                               v-if="
@@ -4552,13 +4705,10 @@ onUnmounted(() => {
                                 @keydown.esc="cancelEdit" /></template
                             ><button
                               v-else
-                              class="paper-editable"
+                              class="paper-editable paper-select-button"
                               type="button"
                               @click.stop="
-                                beginEdit(
-                                  fieldKey(expense, 'occurredDate'),
-                                  expense.occurredDate,
-                                )
+                                handlePaperCellClick($event, expense, 1)
                               "
                             >
                               {{ expense.occurredDate }}
@@ -4588,6 +4738,9 @@ onUnmounted(() => {
                                 2,
                               )
                             "
+                            @click.stop="
+                              handlePaperCellClick($event, expense, 2)
+                            "
                           >
                             <template
                               v-if="editingKey === fieldKey(expense, 'reason')"
@@ -4597,6 +4750,7 @@ onUnmounted(() => {
                                 class="paper-cell-input"
                                 @blur="commitExpense(expense, 'reason')"
                               >
+                                <option value="">请选择事由</option>
                                 <option
                                   v-for="reason in expenseReasons"
                                   :key="reason"
@@ -4607,16 +4761,18 @@ onUnmounted(() => {
                               </select></template
                             ><button
                               v-else
-                              class="paper-editable"
+                              class="paper-editable paper-select-button"
                               type="button"
                               @click.stop="
-                                beginEdit(
-                                  fieldKey(expense, 'reason'),
-                                  expense.reason,
-                                )
+                                handlePaperCellClick($event, expense, 2)
                               "
                             >
-                              {{ expense.reason }}
+                              <span v-if="expense.reason">{{
+                                expense.reason
+                              }}</span
+                              ><span v-else class="paper-empty-hint"
+                                >点击选择</span
+                              >
                             </button>
                           </td>
                           <td
@@ -4644,6 +4800,9 @@ onUnmounted(() => {
                                 3,
                               )
                             "
+                            @click.stop="
+                              handlePaperCellClick($event, expense, 3)
+                            "
                           >
                             <template
                               v-if="
@@ -4663,10 +4822,7 @@ onUnmounted(() => {
                               class="paper-editable description-button"
                               type="button"
                               @click.stop="
-                                beginEdit(
-                                  fieldKey(expense, 'description'),
-                                  expense.description,
-                                )
+                                handlePaperCellClick($event, expense, 3)
                               "
                             >
                               {{ expense.description || "xxxx" }}
@@ -4696,6 +4852,9 @@ onUnmounted(() => {
                                 4,
                               )
                             "
+                            @click.stop="
+                              handlePaperCellClick($event, expense, 4)
+                            "
                           >
                             <template
                               v-if="
@@ -4707,6 +4866,7 @@ onUnmounted(() => {
                                 class="paper-cell-input"
                                 @blur="commitExpense(expense, 'arranger')"
                               >
+                                <option value="">请选择安排人</option>
                                 <option
                                   v-for="arranger in arrangers"
                                   :key="arranger"
@@ -4717,16 +4877,18 @@ onUnmounted(() => {
                               </select></template
                             ><button
                               v-else
-                              class="paper-editable arranger-button"
+                              class="paper-editable paper-select-button arranger-button"
                               type="button"
                               @click.stop="
-                                beginEdit(
-                                  fieldKey(expense, 'arranger'),
-                                  expense.arranger,
-                                )
+                                handlePaperCellClick($event, expense, 4)
                               "
                             >
-                              {{ expense.arranger }}
+                              <span v-if="expense.arranger">{{
+                                expense.arranger
+                              }}</span
+                              ><span v-else class="paper-empty-hint"
+                                >点击选择</span
+                              >
                             </button>
                           </td>
                           <td
@@ -4753,6 +4915,9 @@ onUnmounted(() => {
                                 5,
                               )
                             "
+                            @click.stop="
+                              handlePaperCellClick($event, expense, 5)
+                            "
                           >
                             <template
                               v-if="
@@ -4775,10 +4940,7 @@ onUnmounted(() => {
                               class="paper-editable amount-button"
                               type="button"
                               @click.stop="
-                                beginEdit(
-                                  fieldKey(expense, 'amountCents'),
-                                  (expense.amountCents / 100).toFixed(2),
-                                )
+                                handlePaperCellClick($event, expense, 5)
                               "
                             >
                               {{ money(expense.amountCents) }}
@@ -5471,7 +5633,7 @@ onUnmounted(() => {
           </p>
           <div class="dictionary-group">
             <h4>公司名称字典</h4>
-            <div class="dictionary-options">
+            <div class="dictionary-options" data-dictionary-type="company">
               <div
                 v-for="(company, index) in companyNames"
                 :key="company"
@@ -5479,10 +5641,20 @@ onUnmounted(() => {
                 :class="{
                   default: company === defaultCompany,
                   dragging: isDictionaryDragging('company', company),
+                  'drop-before': isDictionaryDropTarget(
+                    'company',
+                    company,
+                    'before',
+                  ),
+                  'drop-after': isDictionaryDropTarget(
+                    'company',
+                    company,
+                    'after',
+                  ),
                 }"
-                data-dictionary-type="company"
                 :data-dictionary-index="index"
                 :data-dictionary-value="company"
+                @pointerdown="startDictionaryDrag($event, 'company', company)"
               >
                 <span
                   class="dictionary-drag-handle"
@@ -5523,7 +5695,7 @@ onUnmounted(() => {
           </div>
           <div class="dictionary-group">
             <h4>事由字典</h4>
-            <div class="dictionary-options">
+            <div class="dictionary-options" data-dictionary-type="reason">
               <div
                 v-for="(reason, index) in expenseReasons"
                 :key="reason"
@@ -5531,10 +5703,20 @@ onUnmounted(() => {
                 :class="{
                   default: reason === defaultReason,
                   dragging: isDictionaryDragging('reason', reason),
+                  'drop-before': isDictionaryDropTarget(
+                    'reason',
+                    reason,
+                    'before',
+                  ),
+                  'drop-after': isDictionaryDropTarget(
+                    'reason',
+                    reason,
+                    'after',
+                  ),
                 }"
-                data-dictionary-type="reason"
                 :data-dictionary-index="index"
                 :data-dictionary-value="reason"
+                @pointerdown="startDictionaryDrag($event, 'reason', reason)"
               >
                 <span
                   class="dictionary-drag-handle"
@@ -5575,7 +5757,7 @@ onUnmounted(() => {
           </div>
           <div class="dictionary-group">
             <h4>安排人字典</h4>
-            <div class="dictionary-options">
+            <div class="dictionary-options" data-dictionary-type="arranger">
               <div
                 v-for="(arranger, index) in arrangers"
                 :key="arranger"
@@ -5583,10 +5765,20 @@ onUnmounted(() => {
                 :class="{
                   default: arranger === defaultArranger,
                   dragging: isDictionaryDragging('arranger', arranger),
+                  'drop-before': isDictionaryDropTarget(
+                    'arranger',
+                    arranger,
+                    'before',
+                  ),
+                  'drop-after': isDictionaryDropTarget(
+                    'arranger',
+                    arranger,
+                    'after',
+                  ),
                 }"
-                data-dictionary-type="arranger"
                 :data-dictionary-index="index"
                 :data-dictionary-value="arranger"
+                @pointerdown="startDictionaryDrag($event, 'arranger', arranger)"
               >
                 <span
                   class="dictionary-drag-handle"
@@ -6665,6 +6857,12 @@ h3 {
   border: 1px solid #4c4f4f;
   text-align: center;
   vertical-align: middle;
+  user-select: none;
+}
+.paper-table input,
+.paper-table textarea,
+.paper-table select {
+  user-select: text;
 }
 .paper-table th {
   height: 34px;
@@ -6697,7 +6895,7 @@ h3 {
 .paper-table td.paper-cell-selected {
   background: #dceeff !important;
   box-shadow: inset 0 0 0 1px #6aa8d8;
-  user-select: text;
+  user-select: none;
 }
 .paper-table .empty-row td {
   color: #a7afa9;
@@ -6726,6 +6924,8 @@ h3 {
   height: 42px;
 }
 .paper-editable {
+  min-width: 100%;
+  min-height: 28px;
   max-width: 100%;
   padding: 1px 2px;
   border: 0;
@@ -6733,6 +6933,18 @@ h3 {
   background: transparent;
   text-align: inherit;
   white-space: inherit;
+  user-select: none;
+}
+.paper-select-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+.paper-empty-hint {
+  color: #a7afa9;
+  font-size: 10px;
 }
 .paper-editable:hover {
   color: #b9533e;
@@ -8496,6 +8708,12 @@ h3 {
   border-color: #cf674d;
   box-shadow: 0 8px 18px rgba(42, 61, 53, 0.12);
 }
+.dictionary-option.drop-before {
+  box-shadow: inset 3px 0 0 #cf674d;
+}
+.dictionary-option.drop-after {
+  box-shadow: inset -3px 0 0 #cf674d;
+}
 .dictionary-option .el-radio {
   min-width: 0;
   flex: 1;
@@ -8807,6 +9025,13 @@ h3 {
 .exporting-document .paper-table tr.selected-row td {
   background: #fff !important;
 }
+.exporting-document .paper-table td.paper-cell-selected {
+  background: #fff !important;
+  box-shadow: none !important;
+}
+.exporting-document .paper-empty-hint {
+  display: none !important;
+}
 @media print {
   .reimbursement-active .paper-scale,
   .reimbursement-active .paper-scale.double-page-scale {
@@ -8839,6 +9064,13 @@ h3 {
   }
   .paper-table tr.selected-row td {
     background: #fff !important;
+  }
+  .paper-table td.paper-cell-selected {
+    background: #fff !important;
+    box-shadow: none !important;
+  }
+  .paper-empty-hint {
+    display: none !important;
   }
 }
 </style>
