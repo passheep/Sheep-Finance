@@ -16,6 +16,7 @@ app/tmp/
 !.env.example
 *.local
 SheepFinance-配置-*.txt
+文档/20260902-异常退出/
 
 # Editors and operating systems
 .idea/

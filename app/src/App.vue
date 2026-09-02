@@ -41,7 +41,10 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import ExcelJS from "exceljs";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
-import { save as tauriSave } from "@tauri-apps/plugin-dialog";
+import {
+  open as tauriOpen,
+  save as tauriSave,
+} from "@tauri-apps/plugin-dialog";
 import { writeFile as tauriWriteFile } from "@tauri-apps/plugin-fs";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import * as QRCode from "qrcode";
@@ -87,6 +90,10 @@ interface ExtraAttachment {
   id: string;
   fileName: string;
   imageDataUrl: string;
+  blobHash?: string;
+  mimeType?: string;
+  blobExtension?: string;
+  sizeBytes?: number;
   naturalWidth: number;
   naturalHeight: number;
   transform: Transform;
@@ -96,6 +103,13 @@ interface Expense {
   fileName: string;
   imageDataUrl: string;
   recognitionImageDataUrl?: string;
+  blobHash?: string;
+  mimeType?: string;
+  blobExtension?: string;
+  sizeBytes?: number;
+  recognitionBlobHash?: string;
+  recognitionMimeType?: string;
+  recognitionBlobExtension?: string;
   originalSizeBytes?: number;
   recognitionSizeBytes?: number;
   occurredDate: string;
@@ -168,6 +182,10 @@ interface HistoryFolder {
   label: string;
   count: number;
   deleted?: boolean;
+}
+interface HistoryQueryResult {
+  items: HistoryRecord[];
+  total: number;
 }
 interface CellSelection {
   recordId: string;
@@ -260,6 +278,60 @@ interface LoadedWorkspace {
     leftPanelWidth?: number;
     historyViewMode?: HistoryViewMode;
   };
+  dataDirectory: string;
+}
+interface StorageBootstrapResult {
+  status: "ready" | "migrated" | "recoveryRequired" | "migrationFailed";
+  message: string;
+  dataDirectory: string;
+  migratedRecords: number;
+  migratedExpenses: number;
+  migratedAttachments: number;
+  corruptFiles: string[];
+  canUseDefaultSettings: boolean;
+  backupScheduled: boolean;
+}
+interface MigrationProgress {
+  stage: string;
+  current: number;
+  total: number;
+  message: string;
+}
+interface StoredAttachment {
+  blobHash: string;
+  mimeType: string;
+  blobExtension: string;
+  sizeBytes: number;
+  recognitionBlobHash?: string;
+  recognitionMimeType?: string;
+  recognitionBlobExtension?: string;
+  recognitionSizeBytes?: number;
+}
+interface AttachmentBytes {
+  bytes: number[];
+  mimeType: string;
+  extension: string;
+}
+interface DatabaseBackupItem {
+  fileName: string;
+  path: string;
+  createdAt: string;
+  sizeBytes: number;
+  valid: boolean;
+  imagesComplete: boolean;
+  error?: string;
+}
+interface LegacyArchiveItem {
+  directoryName: string;
+  path: string;
+  sizeBytes: number;
+}
+interface BackupStatus {
+  lastBackupAt?: string;
+  validBackupCount: number;
+  backupDue: boolean;
+  backups: DatabaseBackupItem[];
+  legacyArchives: LegacyArchiveItem[];
   dataDirectory: string;
 }
 interface ConfigurationTransferPayload {
@@ -446,6 +518,10 @@ const isExportingPdf = ref(false);
 const isSaved = ref(true);
 const saveText = ref("等待保存");
 const isLoadingWorkspace = ref(true);
+const storageReady = ref(!isTauriRuntime());
+const storageBootstrap = ref<StorageBootstrapResult | null>(null);
+const migrationProgress = ref<MigrationProgress | null>(null);
+const storageRecoveryError = ref("");
 const dataDirectory = ref("");
 const activeTab = ref<AppTab>("reimbursement");
 const historySearch = ref("");
@@ -453,6 +529,9 @@ const historyDate = ref("");
 const historyStatus = ref<ReimbursementStatus | "">("");
 const historyPage = ref(1);
 const historyPageSize = ref(8);
+const historyQueryRecords = ref<HistoryRecord[]>([]);
+const historyQueryTotal = ref(0);
+const isHistoryQueryLoading = ref(false);
 const historyViewMode = ref<HistoryViewMode>("company");
 const historyFolderKey = ref("");
 const isHistoryPreviewOpen = ref(false);
@@ -469,6 +548,9 @@ const isRequestLoading = ref(false);
 const isRequestDetailOpen = ref(false);
 const isRequestDetailLoading = ref(false);
 const requestDetail = ref<RequestLogRecord | null>(null);
+const backupStatus = ref<BackupStatus | null>(null);
+const backupLoading = ref(false);
+const selectedRecoveryBackup = ref("");
 const newCompany = ref("");
 const newReason = ref("");
 const newArranger = ref("");
@@ -485,6 +567,8 @@ let suppressAutoSave = false;
 let lanUploadClockTimer: number | null = null;
 let lanUploadNoticeTimer: number | null = null;
 let lanUploadUnlisten: UnlistenFn | null = null;
+let storageMigrationUnlisten: UnlistenFn | null = null;
+let backupFailureUnlisten: UnlistenFn | null = null;
 let lanUploadListenerReady: Promise<void> | null = null;
 let lanUploadQueue = Promise.resolve();
 let lanUploadPendingEvents = 0;
@@ -559,6 +643,10 @@ const previewAttachments = computed<PreviewAttachment[]>(() =>
       label: `${expenseIndex + 1}`,
       fileName: expense.fileName,
       imageDataUrl: expense.imageDataUrl,
+      blobHash: expense.blobHash,
+      mimeType: expense.mimeType,
+      blobExtension: expense.blobExtension,
+      sizeBytes: expense.sizeBytes,
       naturalWidth: expense.naturalWidth,
       naturalHeight: expense.naturalHeight,
       transform: expense.transform,
@@ -700,7 +788,8 @@ const filteredHistory = computed(() => {
         .toLowerCase()
         .includes(keyword);
     const matchesDate =
-      !historyDate.value || item.updatedAt.slice(0, 10) === historyDate.value;
+      !historyDate.value ||
+      item.firstOccurredDate?.slice(0, 10) === historyDate.value;
     const matchesStatus =
       !historyStatus.value || item.status === historyStatus.value;
     return matchesKeyword && matchesDate && matchesStatus;
@@ -765,10 +854,17 @@ const lastEditedHistoryId = computed(
       )[0]?.id ?? "",
 );
 const pagedHistory = computed(() =>
-  historyScopedRecords.value.slice(
-    (historyPage.value - 1) * historyPageSize.value,
-    historyPage.value * historyPageSize.value,
-  ),
+  isTauriRuntime()
+    ? historyQueryRecords.value
+    : historyScopedRecords.value.slice(
+        (historyPage.value - 1) * historyPageSize.value,
+        historyPage.value * historyPageSize.value,
+      ),
+);
+const historyResultTotal = computed(() =>
+  isTauriRuntime()
+    ? historyQueryTotal.value
+    : historyScopedRecords.value.length,
 );
 const filteredRequests = computed(() => {
   const keyword = requestSearch.value.trim().toLowerCase();
@@ -917,6 +1013,7 @@ function reimbursementStatusType(status: ReimbursementStatus) {
   return "info";
 }
 async function cycleHistoryStatus(item: HistoryRecord) {
+  const previousStatus = item.status;
   const index = REIMBURSEMENT_STATUSES.indexOf(item.status);
   item.status =
     REIMBURSEMENT_STATUSES[(index + 1) % REIMBURSEMENT_STATUSES.length];
@@ -934,7 +1031,25 @@ async function cycleHistoryStatus(item: HistoryRecord) {
       leaveHistoryFolder();
     return;
   }
-  await persistDraft(false);
+  try {
+    if (isTauriRuntime())
+      await invoke("update_record_status", {
+        recordId: item.id,
+        status: item.status,
+      });
+  } catch (error) {
+    item.status = previousStatus;
+    if (historyPreviewDraft.value?.id === item.id)
+      historyPreviewDraft.value.status = previousStatus;
+    ElMessage.error(`状态保存失败：${errorMessage(error)}`);
+    return;
+  }
+  const indexed = historyRecords.value.find((value) => value.id === item.id);
+  if (indexed) {
+    indexed.status = item.status;
+    indexed.updatedAt = item.updatedAt;
+  }
+  await refreshHistoryQuery();
   if (
     historyViewMode.value === "status" &&
     historyFolderKey.value &&
@@ -1204,30 +1319,16 @@ async function recognizeExpense(expense: Expense, notify = true) {
   expense.recognitionError = "";
   dirty();
   try {
+    if (!(await persistDraft(false)))
+      throw new Error("识别前保存单据失败，已取消本次请求");
     const result = await invoke<RecognitionResponse>("recognize_expense", {
       request: {
         recordId: draft.id,
         expenseId: expense.id,
-        fileName: expense.fileName,
-        imageDataUrl: expense.recognitionImageDataUrl ?? expense.imageDataUrl,
+        attachmentId: expense.id,
         ocrMode: expense.ocrMode,
-        ocrProfile: {
-          name: ocrProfile.name,
-          endpoint: ocrProfile.endpoint,
-          region: ocrProfile.region,
-          accessKeyId: ocrProfile.accessKeyId,
-          accessKeySecret: ocrProfile.accessKeySecret,
-          timeoutSeconds: Number(ocrProfile.timeoutSeconds) || 30,
-        },
-        llmProfile: {
-          name: llmProfile.name,
-          baseUrl: llmProfile.baseUrl,
-          apiKey: llmProfile.apiKey,
-          model: llmProfile.model,
-          timeoutSeconds: Number(llmProfile.timeoutSeconds) || 30,
-          multimodal: llmProfile.multimodal,
-        },
-        reasonDictionary: expenseReasons.value,
+        ocrProfileId: ocrProfile.id,
+        llmProfileId: llmProfile.id,
       },
     });
     const current = draft.expenses.find((item) => item.id === expense.id);
@@ -1547,6 +1648,91 @@ function dataUrlSize(dataUrl: string) {
   if (comma < 0) return 0;
   return Math.ceil(((dataUrl.length - comma - 1) * 3) / 4);
 }
+const managedImageUrls = new Set<string>();
+function createManagedImageUrl(value: Blob) {
+  const url = URL.createObjectURL(value);
+  managedImageUrls.add(url);
+  return url;
+}
+function revokeManagedImageUrl(url?: string) {
+  if (!url?.startsWith("blob:") || !managedImageUrls.has(url)) return;
+  URL.revokeObjectURL(url);
+  managedImageUrls.delete(url);
+}
+function revokeDraftImageUrls(value: Draft | null | undefined) {
+  value?.expenses.forEach((expense) => {
+    revokeManagedImageUrl(expense.imageDataUrl);
+    revokeManagedImageUrl(expense.recognitionImageDataUrl);
+    expense.extraAttachments.forEach((attachment) =>
+      revokeManagedImageUrl(attachment.imageDataUrl),
+    );
+  });
+}
+async function loadStoredImageUrl(blobHash?: string) {
+  if (!blobHash || !isTauriRuntime()) return "";
+  const stored = await invoke<AttachmentBytes>("read_attachment", { blobHash });
+  return createManagedImageUrl(
+    new Blob([new Uint8Array(stored.bytes)], { type: stored.mimeType }),
+  );
+}
+async function hydrateDraftImages(value: Draft) {
+  if (!isTauriRuntime()) return value;
+  const jobs: Promise<void>[] = [];
+  value.expenses.forEach((expense) => {
+    if (expense.blobHash && !expense.imageDataUrl) {
+      jobs.push(
+        loadStoredImageUrl(expense.blobHash).then((url) => {
+          expense.imageDataUrl = url;
+        }),
+      );
+    }
+    expense.extraAttachments.forEach((attachment) => {
+      if (!attachment.blobHash || attachment.imageDataUrl) return;
+      jobs.push(
+        loadStoredImageUrl(attachment.blobHash).then((url) => {
+          attachment.imageDataUrl = url;
+        }),
+      );
+    });
+  });
+  try {
+    await Promise.all(jobs);
+    return value;
+  } catch (error) {
+    revokeDraftImageUrls(value);
+    throw error;
+  }
+}
+function applyStoredAttachment(
+  target: Expense | ExtraAttachment,
+  stored: StoredAttachment,
+) {
+  target.blobHash = stored.blobHash;
+  target.mimeType = stored.mimeType;
+  target.blobExtension = stored.blobExtension;
+  target.sizeBytes = stored.sizeBytes;
+  if ("ocrMode" in target) {
+    target.recognitionBlobHash = stored.recognitionBlobHash;
+    target.recognitionMimeType = stored.recognitionMimeType;
+    target.recognitionBlobExtension = stored.recognitionBlobExtension;
+    target.recognitionSizeBytes = stored.recognitionSizeBytes;
+  }
+}
+async function persistImage(
+  imageDataUrl: string,
+  recognitionDataUrl: string | undefined,
+  width: number,
+  height: number,
+) {
+  return invoke<StoredAttachment>("store_attachment", {
+    request: {
+      dataUrl: imageDataUrl,
+      recognitionDataUrl,
+      naturalWidth: width,
+      naturalHeight: height,
+    },
+  });
+}
 function loadImage(dataUrl: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
@@ -1621,6 +1807,14 @@ async function addFile(file: File, notify = true, targetRecordId = draft.id) {
       image.width,
       image.height,
     );
+    const stored = isTauriRuntime()
+      ? await persistImage(
+          image.dataUrl,
+          recognitionImageDataUrl,
+          image.width,
+          image.height,
+        )
+      : null;
     if (draft.id !== targetRecordId) return false;
     if (
       draft.expenses.length >= MAX_EXPENSES ||
@@ -1636,8 +1830,12 @@ async function addFile(file: File, notify = true, targetRecordId = draft.id) {
       id: id("expense"),
       fileName:
         file.name || "剪贴板图片-" + (draft.expenses.length + 1) + ".png",
-      imageDataUrl: image.dataUrl,
-      recognitionImageDataUrl,
+      imageDataUrl: isTauriRuntime()
+        ? createManagedImageUrl(file)
+        : image.dataUrl,
+      recognitionImageDataUrl: isTauriRuntime()
+        ? undefined
+        : recognitionImageDataUrl,
       originalSizeBytes: dataUrlSize(image.dataUrl),
       recognitionSizeBytes: dataUrlSize(recognitionImageDataUrl),
       occurredDate: today(),
@@ -1654,6 +1852,7 @@ async function addFile(file: File, notify = true, targetRecordId = draft.id) {
       extraAttachments: [],
       manualFields: {},
     };
+    if (stored) applyStoredAttachment(expense, stored);
     draft.expenses.push(expense);
     reflowExpenses();
     selectedId.value = expense.id;
@@ -1728,6 +1927,9 @@ async function addExtraAttachmentFile(
   }
   try {
     const image = await readImage(file);
+    const stored = isTauriRuntime()
+      ? await persistImage(image.dataUrl, undefined, image.width, image.height)
+      : null;
     const current = draft.expenses.find((item) => item.id === expenseId);
     if (
       !current ||
@@ -1740,11 +1942,14 @@ async function addExtraAttachmentFile(
       fileName:
         file.name ||
         `附加图片-${current.extraAttachments.length + 1}-${Date.now()}.png`,
-      imageDataUrl: image.dataUrl,
+      imageDataUrl: isTauriRuntime()
+        ? createManagedImageUrl(file)
+        : image.dataUrl,
       naturalWidth: image.width,
       naturalHeight: image.height,
       transform: transform(0, 1),
     };
+    if (stored) applyStoredAttachment(attachment, stored);
     current.extraAttachments.push(attachment);
     reflowAttachments();
     selectedId.value = current.id;
@@ -1807,11 +2012,14 @@ async function removeExtraAttachment(
       (item) => item.id === attachment.id,
     );
     if (index < 0) return;
+    revokeManagedImageUrl(attachment.imageDataUrl);
     expense.extraAttachments.splice(index, 1);
     reflowAttachments();
     selectedAttachmentId.value = expense.id;
     selectedId.value = expense.id;
     dirty();
+    if (isTauriRuntime() && (await persistDraft(false)))
+      void invoke("cleanup_orphan_images");
     ElMessage.success("附加图片已删除");
   } catch {
     /* 用户取消 */
@@ -2038,11 +2246,18 @@ async function removeExpense(expense: Expense) {
     );
     const index = draft.expenses.findIndex((item) => item.id === expense.id);
     if (index < 0) return;
+    revokeManagedImageUrl(expense.imageDataUrl);
+    revokeManagedImageUrl(expense.recognitionImageDataUrl);
+    expense.extraAttachments.forEach((attachment) =>
+      revokeManagedImageUrl(attachment.imageDataUrl),
+    );
     draft.expenses.splice(index, 1);
     reflowExpenses();
     selectedId.value = draft.expenses[Math.max(0, index - 1)]?.id ?? null;
     selectedAttachmentId.value = selectedId.value;
     dirty();
+    if (isTauriRuntime() && (await persistDraft(false)))
+      void invoke("cleanup_orphan_images");
     ElMessage.success("费用已删除");
   } catch {
     /* 用户取消 */
@@ -2475,7 +2690,12 @@ function normalizeHistory(value: Partial<HistoryRecord>): HistoryRecord {
   };
 }
 async function persistDraft(showMessage = false) {
-  if (isLoadingWorkspace.value || suppressAutoSave) return false;
+  if (
+    isLoadingWorkspace.value ||
+    suppressAutoSave ||
+    (isTauriRuntime() && !storageReady.value)
+  )
+    return false;
   const revision = autoSaveRevision;
   saveText.value = showMessage ? "正在保存" : "正在自动保存";
   const snapshot = cloneDraft();
@@ -2502,7 +2722,6 @@ async function persistDraft(showMessage = false) {
             ocrProfiles: ocrProfiles.value,
             llmProfiles: llmProfiles.value,
           },
-          history: nextHistory.map(({ draft: _draft, ...summary }) => summary),
           uiPreferences: uiPreferencesSnapshot(),
         },
       });
@@ -2546,6 +2765,8 @@ async function persistDraft(showMessage = false) {
     saveText.value = isSaved.value
       ? `已保存 ${formatSaveTime(new Date())}`
       : "尚未保存";
+    if (isTauriRuntime() && activeTab.value === "history")
+      await refreshHistoryQuery();
     if (showMessage) ElMessage.success("草稿已保存到本机");
     return true;
   } catch (error) {
@@ -2564,8 +2785,11 @@ function applyDraft(value: Draft) {
   selectedId.value = draft.expenses[0]?.id ?? null;
   selectedAttachmentId.value = selectedId.value;
 }
-function applyWorkspace(value: LoadedWorkspace) {
-  if (value.draft?.id) applyDraft(value.draft);
+function replaceActiveDraft(value: Draft) {
+  revokeDraftImageUrls(draft);
+  applyDraft(value);
+}
+async function applyWorkspace(value: LoadedWorkspace) {
   if (value.profiles?.length) profiles.value = value.profiles;
   if (value.dictionaries?.companies?.length)
     companyNames.value = value.dictionaries.companies;
@@ -2604,6 +2828,13 @@ function applyWorkspace(value: LoadedWorkspace) {
     historyViewMode.value = normalizeHistoryViewMode(
       value.uiPreferences.historyViewMode,
     );
+  if (value.draft?.id) {
+    const restored = normalizeDraftForUse(value.draft);
+    await hydrateDraftImages(restored);
+    replaceActiveDraft(restored);
+  } else {
+    replaceActiveDraft(createDraft());
+  }
   dataDirectory.value = value.dataDirectory;
 }
 function loadBrowserWorkspace() {
@@ -2675,23 +2906,78 @@ function loadBrowserWorkspace() {
   );
 }
 async function loadDraft() {
-  let migrateBrowserData = false;
   try {
     if (isTauriRuntime()) {
-      const workspace = await invoke<LoadedWorkspace | null>("load_workspace");
-      if (workspace) applyWorkspace(workspace);
-      else migrateBrowserData = loadBrowserWorkspace();
-    } else loadBrowserWorkspace();
+      let bootstrap = await invoke<StorageBootstrapResult>(
+        "bootstrap_storage",
+        { allowDefaultSettings: false },
+      );
+      if (
+        bootstrap.status === "migrationFailed" &&
+        bootstrap.canUseDefaultSettings
+      ) {
+        try {
+          await ElMessageBox.confirm(
+            `${bootstrap.message}\n\n是否仅恢复所有可读单据，并对损坏的设置使用默认值？`,
+            "旧版设置损坏",
+            {
+              confirmButtonText: "仅恢复单据",
+              cancelButtonText: "暂不处理",
+              type: "warning",
+              closeOnClickModal: false,
+              closeOnPressEscape: false,
+            },
+          );
+          bootstrap = await invoke<StorageBootstrapResult>(
+            "bootstrap_storage",
+            { allowDefaultSettings: true },
+          );
+        } catch {
+          /* 用户保留旧数据，不启用空工作区 */
+        }
+      }
+      storageBootstrap.value = bootstrap;
+      dataDirectory.value = bootstrap.dataDirectory;
+      if (bootstrap.status === "recoveryRequired") {
+        storageRecoveryError.value = bootstrap.message;
+        await loadBackupStatus();
+        return;
+      }
+      if (bootstrap.status === "migrationFailed") {
+        storageRecoveryError.value = bootstrap.message;
+        return;
+      }
+      storageReady.value = true;
+      const workspace = await invoke<LoadedWorkspace>("load_workspace");
+      await applyWorkspace(workspace);
+      await invoke<boolean>("schedule_storage_backup");
+      if (bootstrap.status === "migrated") {
+        ElMessage.success(
+          `已迁移 ${bootstrap.migratedRecords} 份单据、${bootstrap.migratedExpenses} 条费用和 ${bootstrap.migratedAttachments} 张图片`,
+        );
+      }
+    } else {
+      loadBrowserWorkspace();
+    }
     isSaved.value = true;
     saveText.value = `已保存 ${formatSaveTime(draft.updatedAt)}`;
   } catch (error) {
-    ElMessage.warning(
-      `本地草稿读取失败，已创建空白报销单：${errorMessage(error)}`,
-    );
+    storageReady.value = false;
+    storageRecoveryError.value = `本地数据未能安全打开：${errorMessage(error)}`;
+    storageBootstrap.value = {
+      status: "migrationFailed",
+      message: storageRecoveryError.value,
+      dataDirectory: dataDirectory.value,
+      migratedRecords: 0,
+      migratedExpenses: 0,
+      migratedAttachments: 0,
+      corruptFiles: [],
+      canUseDefaultSettings: false,
+      backupScheduled: false,
+    };
   } finally {
     isLoadingWorkspace.value = false;
   }
-  if (migrateBrowserData) await persistDraft(false);
 }
 async function loadHistoryDraft(item: HistoryRecord) {
   const raw = item.draft
@@ -2701,12 +2987,14 @@ async function loadHistoryDraft(item: HistoryRecord) {
   restored.label = item.label;
   restored.status = item.status;
   restored.updatedAt = item.updatedAt;
+  await hydrateDraftImages(restored);
   return restored;
 }
 async function openHistoryPreview(item: HistoryRecord) {
   isHistoryPreviewOpen.value = true;
   isHistoryPreviewLoading.value = true;
   historyPreviewItem.value = item;
+  revokeDraftImageUrls(historyPreviewDraft.value);
   historyPreviewDraft.value = null;
   try {
     const restored = await loadHistoryDraft(item);
@@ -2725,7 +3013,7 @@ async function openHistoryPreview(item: HistoryRecord) {
 async function editHistory(item: HistoryRecord) {
   try {
     const restored = await loadHistoryDraft(item);
-    applyDraft(restored);
+    replaceActiveDraft(restored);
     isHistoryPreviewOpen.value = false;
     switchTab("reimbursement");
     isSaved.value = true;
@@ -2746,6 +3034,9 @@ function resetRecognitionMetadata(expense: Expense) {
   expense.lastLlmProfile = undefined;
   expense.lastRecognitionMs = undefined;
   expense.recognitionImageDataUrl = undefined;
+  expense.recognitionBlobHash = undefined;
+  expense.recognitionMimeType = undefined;
+  expense.recognitionBlobExtension = undefined;
   expense.originalSizeBytes = undefined;
   expense.recognitionSizeBytes = undefined;
   expense.manualFields = {};
@@ -2768,7 +3059,7 @@ async function createFromHistoryTemplate(item: HistoryRecord) {
         attachment.id = id("attachment");
       });
     });
-    applyDraft(created);
+    replaceActiveDraft(created);
     isHistoryPreviewOpen.value = false;
     switchTab("reimbursement");
     dirty();
@@ -2777,13 +3068,52 @@ async function createFromHistoryTemplate(item: HistoryRecord) {
     ElMessage.error(errorMessage(error));
   }
 }
+async function refreshHistoryQuery() {
+  if (!isTauriRuntime() || !storageReady.value) return;
+  if (historyViewMode.value !== "list" && !historyFolderKey.value) {
+    historyQueryRecords.value = [];
+    historyQueryTotal.value = 0;
+    return;
+  }
+  const prefix = `${historyViewMode.value}:`;
+  const folderKey = historyFolderKey.value.startsWith(prefix)
+    ? historyFolderKey.value.slice(prefix.length)
+    : "";
+  isHistoryQueryLoading.value = true;
+  try {
+    const result = await invoke<HistoryQueryResult>("query_history", {
+      query: {
+        keyword: historySearch.value.trim(),
+        date: historyDate.value,
+        status: historyStatus.value,
+        folderKind:
+          historyViewMode.value === "list" ? "" : historyViewMode.value,
+        folderKey:
+          folderKey === "未填写公司" && historyViewMode.value === "company"
+            ? ""
+            : folderKey,
+        page: historyPage.value,
+        pageSize: historyPageSize.value,
+      },
+    });
+    historyQueryRecords.value = result.items.map(normalizeHistory);
+    historyQueryTotal.value = result.total;
+  } catch (error) {
+    ElMessage.error(`历史记录查询失败：${errorMessage(error)}`);
+  } finally {
+    isHistoryQueryLoading.value = false;
+  }
+}
 function openHistoryFolder(folder: HistoryFolder) {
   historyFolderKey.value = folder.key;
   historyPage.value = 1;
+  void refreshHistoryQuery();
 }
 function leaveHistoryFolder() {
   historyFolderKey.value = "";
   historyPage.value = 1;
+  historyQueryRecords.value = [];
+  historyQueryTotal.value = 0;
 }
 async function removeHistory(item: HistoryRecord): Promise<boolean> {
   const deletingCurrent = item.id === draft.id;
@@ -2797,6 +3127,7 @@ async function removeHistory(item: HistoryRecord): Promise<boolean> {
     );
     if (deletingCurrent) {
       suppressAutoSave = true;
+      revokeDraftImageUrls(draft);
       Object.assign(draft, createDraft());
       selectedId.value = null;
       selectedAttachmentId.value = null;
@@ -2808,6 +3139,7 @@ async function removeHistory(item: HistoryRecord): Promise<boolean> {
     const saved = await persistDraft(false);
     if (!saved) throw new Error("本地工作区保存失败，未执行记录删除");
     if (isTauriRuntime()) await invoke("delete_record", { recordId: item.id });
+    await refreshHistoryQuery();
     if (historyFolderKey.value && !historyScopedRecords.value.length)
       leaveHistoryFolder();
     ElMessage.success("历史记录已删除");
@@ -2942,6 +3274,8 @@ function switchTab(tab: AppTab) {
   commitActiveEdit();
   activeTab.value = tab;
   if (tab === "requests") void loadRequestLogs();
+  if (tab === "settings") void loadBackupStatus();
+  if (tab === "history") void refreshHistoryQuery();
   nextTick(() => {
     if (tab === "reimbursement") updateScale();
   });
@@ -3010,6 +3344,7 @@ function newRecord() {
   commitActiveEdit();
   switchTab("reimbursement");
   if (!isSaved.value || draft.expenses.length) void persistDraft(false);
+  revokeDraftImageUrls(draft);
   Object.assign(draft, createDraft());
   selectedId.value = null;
   selectedAttachmentId.value = null;
@@ -3029,6 +3364,10 @@ function normalizeExtraAttachment(
     id: value.id ?? id("attachment"),
     fileName: value.fileName ?? `附加图片-${index + 1}.png`,
     imageDataUrl: value.imageDataUrl ?? "",
+    blobHash: value.blobHash,
+    mimeType: value.mimeType,
+    blobExtension: value.blobExtension,
+    sizeBytes: value.sizeBytes,
     naturalWidth: value.naturalWidth ?? 1,
     naturalHeight: value.naturalHeight ?? 1,
     transform: { ...fallbackTransform, ...(value.transform ?? {}) },
@@ -3045,6 +3384,13 @@ function normalizeExpense(
     fileName: value.fileName ?? `费用截图-${index + 1}.png`,
     imageDataUrl: value.imageDataUrl ?? "",
     recognitionImageDataUrl: value.recognitionImageDataUrl,
+    blobHash: value.blobHash,
+    mimeType: value.mimeType,
+    blobExtension: value.blobExtension,
+    sizeBytes: value.sizeBytes,
+    recognitionBlobHash: value.recognitionBlobHash,
+    recognitionMimeType: value.recognitionMimeType,
+    recognitionBlobExtension: value.recognitionBlobExtension,
     originalSizeBytes: value.originalSizeBytes,
     recognitionSizeBytes: value.recognitionSizeBytes,
     occurredDate: value.occurredDate ?? today(),
@@ -3385,6 +3731,249 @@ async function importConfiguration(event: Event) {
       ElMessage.error(`配置导入失败：${errorMessage(error)}`);
   }
 }
+function formatFileSize(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  if (value < 1024) return `${Math.round(value)} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024)
+    return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+async function loadBackupStatus() {
+  if (!isTauriRuntime()) return;
+  try {
+    backupStatus.value = await invoke<BackupStatus>("get_backup_status");
+    if (
+      !selectedRecoveryBackup.value ||
+      !backupStatus.value.backups.some(
+        (item) => item.fileName === selectedRecoveryBackup.value,
+      )
+    ) {
+      selectedRecoveryBackup.value =
+        backupStatus.value.backups.find(
+          (item) => item.valid && item.imagesComplete,
+        )?.fileName ?? "";
+    }
+  } catch (error) {
+    backupStatus.value = null;
+    storageRecoveryError.value =
+      `${storageRecoveryError.value}\n${errorMessage(error)}`.trim();
+  }
+}
+async function createDatabaseBackup() {
+  if (!isTauriRuntime()) return;
+  backupLoading.value = true;
+  try {
+    if (!(await persistDraft(false)))
+      throw new Error("当前单据保存失败，已取消数据库备份");
+    await invoke("create_database_backup");
+    await loadBackupStatus();
+    ElMessage.success("数据库备份已创建并通过完整性检查");
+  } catch (error) {
+    ElMessage.error(`数据库备份失败：${errorMessage(error)}`);
+  } finally {
+    backupLoading.value = false;
+  }
+}
+async function restoreDatabaseBackup(item?: DatabaseBackupItem) {
+  const target =
+    item ??
+    backupStatus.value?.backups.find(
+      (value) => value.fileName === selectedRecoveryBackup.value,
+    );
+  if (!target || !target.valid || !target.imagesComplete) {
+    ElMessage.warning("请选择一份数据库和图片都完整的备份");
+    return;
+  }
+  try {
+    await ElMessageBox.confirm(
+      `将恢复备份 ${target.fileName}。当前数据库文件会先保留为 recovery-preserved 文件，是否继续？`,
+      "恢复数据库",
+      { confirmButtonText: "恢复", cancelButtonText: "取消", type: "warning" },
+    );
+    backupLoading.value = true;
+    if (storageReady.value && !(await persistDraft(false)))
+      throw new Error("当前单据保存失败，已取消数据库恢复");
+    await invoke("restore_database_backup", { fileName: target.fileName });
+    window.location.reload();
+  } catch (error) {
+    if (error !== "cancel" && error !== "close")
+      ElMessage.error(`恢复数据库失败：${errorMessage(error)}`);
+  } finally {
+    backupLoading.value = false;
+  }
+}
+async function openBackupDirectory() {
+  try {
+    await invoke("open_backup_directory");
+  } catch (error) {
+    ElMessage.error(errorMessage(error));
+  }
+}
+async function exportFullBackup() {
+  const destination = await tauriSave({
+    defaultPath: `SheepFinance-完整备份-${today()}.zip`,
+    filters: [{ name: "ZIP 备份", extensions: ["zip"] }],
+  });
+  if (!destination) return;
+  backupLoading.value = true;
+  try {
+    if (!(await persistDraft(false)))
+      throw new Error("当前单据保存失败，已取消完整备份导出");
+    await invoke("export_full_backup", { destination });
+    ElMessage.success("完整备份已导出，其中包含 API 密钥，请妥善保管");
+  } catch (error) {
+    ElMessage.error(`完整备份导出失败：${errorMessage(error)}`);
+  } finally {
+    backupLoading.value = false;
+  }
+}
+async function importFullBackup() {
+  const selected = await tauriOpen({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "ZIP 备份", extensions: ["zip"] }],
+  });
+  if (!selected || Array.isArray(selected)) return;
+  try {
+    await ElMessageBox.confirm(
+      "导入前会校验数据库、图片和哈希清单，并先备份当前数据库。导入后软件将重新加载，是否继续？",
+      "导入完整备份",
+      { confirmButtonText: "导入", cancelButtonText: "取消", type: "warning" },
+    );
+    backupLoading.value = true;
+    if (storageReady.value && !(await persistDraft(false)))
+      throw new Error("当前单据保存失败，已取消完整备份导入");
+    await invoke("import_full_backup", { source: selected });
+    window.location.reload();
+  } catch (error) {
+    if (error !== "cancel" && error !== "close")
+      ElMessage.error(`完整备份导入失败：${errorMessage(error)}`);
+  } finally {
+    backupLoading.value = false;
+  }
+}
+async function cleanupLegacyArchives() {
+  const archives = backupStatus.value?.legacyArchives ?? [];
+  if (!archives.length) return;
+  const size = archives.reduce((sum, item) => sum + item.sizeBytes, 0);
+  try {
+    await ElMessageBox.confirm(
+      `将永久删除 ${archives.length} 个旧 JSON 归档（${formatFileSize(size)}）。已迁移的数据库和图片不受影响，是否继续？`,
+      "清理旧数据",
+      {
+        confirmButtonText: "永久删除",
+        cancelButtonText: "取消",
+        type: "warning",
+      },
+    );
+    const removed = await invoke<number>("cleanup_legacy_archives");
+    await loadBackupStatus();
+    ElMessage.success(`已清理 ${formatFileSize(removed)} 旧数据`);
+  } catch (error) {
+    if (error !== "cancel" && error !== "close")
+      ElMessage.error(errorMessage(error));
+  }
+}
+async function attachmentBlob(
+  attachment: PreviewAttachment | ExtraAttachment | Expense,
+) {
+  if (!attachment.blobHash) throw new Error("该图片尚未存入本地图片池");
+  const value = await invoke<AttachmentBytes>("read_attachment", {
+    blobHash: attachment.blobHash,
+  });
+  return {
+    blob: new Blob([new Uint8Array(value.bytes)], { type: value.mimeType }),
+    extension: value.extension,
+  };
+}
+async function copyOriginalImage(
+  attachment:
+    | PreviewAttachment
+    | ExtraAttachment
+    | Expense
+    | null = selectedAttachment.value,
+) {
+  if (!attachment) return;
+  try {
+    const { blob } = await attachmentBlob(attachment);
+    if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined")
+      throw new Error("当前系统不支持图片剪贴板");
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({ [blob.type]: blob }),
+      ]);
+    } catch {
+      const sourceUrl = URL.createObjectURL(blob);
+      try {
+        const image = await loadImage(sourceUrl);
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("无法读取图片画布");
+        context.drawImage(image, 0, 0);
+        const png = await new Promise<Blob>((resolve, reject) =>
+          canvas.toBlob(
+            (value) =>
+              value ? resolve(value) : reject(new Error("图片转换失败")),
+            "image/png",
+          ),
+        );
+        await navigator.clipboard.write([
+          new ClipboardItem({ "image/png": png }),
+        ]);
+      } finally {
+        URL.revokeObjectURL(sourceUrl);
+      }
+    }
+    ElMessage.success("原图已写入剪贴板");
+  } catch (error) {
+    ElMessage.error(`复制原图失败：${errorMessage(error)}`);
+  }
+}
+async function saveOriginalImage(
+  attachment:
+    | PreviewAttachment
+    | ExtraAttachment
+    | Expense
+    | null = selectedAttachment.value,
+) {
+  if (!attachment?.blobHash) return;
+  try {
+    const stored = await attachmentBlob(attachment);
+    const baseName = attachment.fileName.replace(/[\\/:*?"<>|]/g, "_");
+    const suggested = baseName.includes(".")
+      ? baseName
+      : `${baseName || "票据原图"}.${stored.extension}`;
+    const destination = await tauriSave({
+      defaultPath: suggested,
+      filters: [{ name: "图片", extensions: [stored.extension] }],
+    });
+    if (!destination) return;
+    await invoke("save_attachment_as", {
+      blobHash: attachment.blobHash,
+      destination,
+    });
+    ElMessage.success("原图已保存");
+  } catch (error) {
+    ElMessage.error(`另存原图失败：${errorMessage(error)}`);
+  }
+}
+async function openOriginalImageFolder(
+  attachment:
+    | PreviewAttachment
+    | ExtraAttachment
+    | Expense
+    | null = selectedAttachment.value,
+) {
+  if (!attachment?.blobHash) return;
+  try {
+    await invoke("open_attachment_folder", { blobHash: attachment.blobHash });
+  } catch (error) {
+    ElMessage.error(errorMessage(error));
+  }
+}
 async function openExternalUrl(url: string) {
   try {
     if (isTauriRuntime()) await openUrl(url);
@@ -3392,6 +3981,9 @@ async function openExternalUrl(url: string) {
   } catch (error) {
     ElMessage.error(`链接打开失败：${errorMessage(error)}`);
   }
+}
+function reloadApplication() {
+  window.location.reload();
 }
 async function waitForExportAssets(root: HTMLElement) {
   await document.fonts?.ready;
@@ -3546,6 +4138,7 @@ async function withTemporaryDraft<T>(
     return await callback();
   } finally {
     applyDraft(current);
+    revokeDraftImageUrls(source);
     selectedId.value = previousSelectedId;
     selectedAttachmentId.value = previousSelectedAttachmentId;
     activeTab.value = previousTab;
@@ -3954,7 +4547,12 @@ function removeProfile(profile: Profile) {
 }
 
 function scheduleAutoSave() {
-  if (isLoadingWorkspace.value || suppressAutoSave) return;
+  if (
+    isLoadingWorkspace.value ||
+    suppressAutoSave ||
+    (isTauriRuntime() && !storageReady.value)
+  )
+    return;
   autoSaveRevision += 1;
   isSaved.value = false;
   saveText.value = "尚未保存";
@@ -3983,14 +4581,22 @@ watch(
 watch([leftPanelWidth, historyViewMode], scheduleAutoSave);
 watch([historySearch, historyDate, historyStatus], () => {
   historyPage.value = 1;
-  historyFolderKey.value = "";
+  void refreshHistoryQuery();
 });
 watch(historyViewMode, () => {
   historyPage.value = 1;
   historyFolderKey.value = "";
+  void refreshHistoryQuery();
 });
+watch([historyPage, historyPageSize], () => void refreshHistoryQuery());
 watch([requestSearch, requestService, requestStatus], () => {
   requestPage.value = 1;
+});
+watch(isHistoryPreviewOpen, (open) => {
+  if (open) return;
+  revokeDraftImageUrls(historyPreviewDraft.value);
+  historyPreviewDraft.value = null;
+  historyPreviewItem.value = null;
 });
 watch(
   [
@@ -4020,7 +4626,26 @@ function preventContextMenu(event: MouseEvent) {
   event.preventDefault();
 }
 onMounted(() => {
-  void loadDraft();
+  void (async () => {
+    if (isTauriRuntime()) {
+      try {
+        storageMigrationUnlisten = await listen<MigrationProgress>(
+          "storage-migration-progress",
+          (event) => {
+            migrationProgress.value = event.payload;
+          },
+        );
+        backupFailureUnlisten = await listen<string>(
+          "database-backup-failed",
+          (event) => ElMessage.error(`自动备份失败：${event.payload}`),
+        );
+      } catch {
+        storageMigrationUnlisten = null;
+        backupFailureUnlisten = null;
+      }
+    }
+    await loadDraft();
+  })();
   lanUploadClockTimer = window.setInterval(() => {
     lanUploadNow.value = Date.now();
   }, 1000);
@@ -4051,6 +4676,12 @@ onUnmounted(() => {
   lanUploadUnlisten?.();
   lanUploadUnlisten = null;
   lanUploadListenerReady = null;
+  storageMigrationUnlisten?.();
+  storageMigrationUnlisten = null;
+  backupFailureUnlisten?.();
+  backupFailureUnlisten = null;
+  revokeDraftImageUrls(draft);
+  revokeDraftImageUrls(historyPreviewDraft.value);
   void stopLanUploadSession();
   window.removeEventListener("resize", updateScale);
   window.removeEventListener("pointerdown", expenseDragStart);
@@ -4079,6 +4710,78 @@ onUnmounted(() => {
     :class="{ 'reimbursement-active': activeTab === 'reimbursement' }"
     @contextmenu.prevent
   >
+    <div
+      v-if="isLoadingWorkspace || (isTauriRuntime() && !storageReady)"
+      class="storage-gate"
+    >
+      <section class="storage-gate-panel">
+        <template v-if="isLoadingWorkspace">
+          <span class="eyebrow">LOCAL STORAGE</span>
+          <h1>
+            {{ migrationProgress ? "正在迁移旧版数据" : "正在检查本地数据" }}
+          </h1>
+          <p>{{ migrationProgress?.message || "请勿关闭软件" }}</p>
+          <el-progress
+            v-if="migrationProgress?.total"
+            :percentage="
+              Math.round(
+                (migrationProgress.current / migrationProgress.total) * 100,
+              )
+            "
+            :stroke-width="10"
+          />
+          <div v-else class="storage-spinner" />
+        </template>
+        <template v-else>
+          <WarningFilled :size="36" />
+          <span class="eyebrow">RECOVERY REQUIRED</span>
+          <h1>本地数据未启用</h1>
+          <p class="storage-gate-error">{{ storageRecoveryError }}</p>
+          <p v-if="dataDirectory" class="storage-gate-path">
+            数据目录：{{ dataDirectory }}
+          </p>
+          <template v-if="storageBootstrap?.status === 'recoveryRequired'">
+            <el-select
+              v-model="selectedRecoveryBackup"
+              placeholder="选择一份可恢复备份"
+              class="storage-recovery-select"
+            >
+              <el-option
+                v-for="item in backupStatus?.backups ?? []"
+                :key="item.fileName"
+                :label="`${formatDateTime(item.createdAt)} · ${formatFileSize(item.sizeBytes)}${item.valid && item.imagesComplete ? '' : ' · 不可用'}`"
+                :value="item.fileName"
+                :disabled="!item.valid || !item.imagesComplete"
+              />
+            </el-select>
+            <div class="storage-gate-actions">
+              <el-button @click="openBackupDirectory">打开备份目录</el-button>
+              <el-button @click="importFullBackup">导入完整备份</el-button>
+              <el-button
+                type="primary"
+                :loading="backupLoading"
+                :disabled="!selectedRecoveryBackup"
+                @click="restoreDatabaseBackup()"
+                >恢复选中备份</el-button
+              >
+            </div>
+          </template>
+          <template v-else>
+            <div
+              v-if="storageBootstrap?.corruptFiles.length"
+              class="storage-file-list"
+            >
+              <span v-for="file in storageBootstrap.corruptFiles" :key="file">{{
+                file
+              }}</span>
+            </div>
+            <el-button type="primary" @click="reloadApplication"
+              >重新检查</el-button
+            >
+          </template>
+        </template>
+      </section>
+    </div>
     <header class="topbar">
       <div class="brand-block">
         <div class="brand-mark">S</div>
@@ -5092,6 +5795,25 @@ onUnmounted(() => {
               <el-button
                 circle
                 text
+                :icon="CopyDocument"
+                title="复制原图"
+                @click="copyOriginalImage()"
+              /><el-button
+                circle
+                text
+                :icon="Download"
+                title="另存原图"
+                @click="saveOriginalImage()"
+              /><el-button
+                circle
+                text
+                :icon="Folder"
+                title="打开所在目录"
+                @click="openOriginalImageFolder()"
+              />
+              <el-button
+                circle
+                text
                 :icon="Refresh"
                 title="恢复默认位置"
                 @click="resetImage"
@@ -5460,6 +6182,98 @@ onUnmounted(() => {
               />
             </el-form-item>
           </el-form>
+        </div>
+        <div class="drawer-section backup-section" v-loading="backupLoading">
+          <div class="drawer-section-heading">
+            <div>
+              <span class="eyebrow">BACKUP &amp; RECOVERY</span>
+              <h3>数据备份与恢复</h3>
+            </div>
+            <el-button text type="primary" @click="loadBackupStatus">
+              <Refresh :size="15" />刷新
+            </el-button>
+          </div>
+          <div class="backup-summary">
+            <div>
+              <span>最近有效备份</span>
+              <strong>{{
+                backupStatus?.lastBackupAt
+                  ? formatDateTime(backupStatus.lastBackupAt)
+                  : "尚未创建"
+              }}</strong>
+            </div>
+            <div>
+              <span>有效备份</span>
+              <strong>{{ backupStatus?.validBackupCount ?? 0 }} / 5</strong>
+            </div>
+            <div>
+              <span>自动备份</span>
+              <strong>{{
+                backupStatus?.backupDue ? "本次启动已到期" : "72 小时检查"
+              }}</strong>
+            </div>
+          </div>
+          <div class="backup-actions">
+            <el-button type="primary" @click="createDatabaseBackup">
+              <Download :size="15" />立即备份
+            </el-button>
+            <el-button @click="openBackupDirectory">
+              <Folder :size="15" />打开备份目录
+            </el-button>
+            <el-button @click="exportFullBackup">导出完整备份</el-button>
+            <el-button @click="importFullBackup">导入完整备份</el-button>
+          </div>
+          <div v-if="backupStatus?.backups.length" class="backup-list">
+            <div v-for="item in backupStatus.backups" :key="item.fileName">
+              <span>
+                <strong>{{ formatDateTime(item.createdAt) }}</strong>
+                <small
+                  >{{ formatFileSize(item.sizeBytes) }} ·
+                  {{ item.fileName }}</small
+                >
+              </span>
+              <el-tag
+                :type="item.valid && item.imagesComplete ? 'success' : 'danger'"
+                >{{
+                  item.valid && item.imagesComplete ? "可恢复" : "校验失败"
+                }}</el-tag
+              >
+              <el-button
+                text
+                type="primary"
+                :disabled="!item.valid || !item.imagesComplete"
+                @click="restoreDatabaseBackup(item)"
+                >恢复</el-button
+              >
+            </div>
+          </div>
+          <div
+            v-if="backupStatus?.legacyArchives.length"
+            class="legacy-summary"
+          >
+            <span>
+              已保留 {{ backupStatus.legacyArchives.length }} 个旧 JSON 归档，共
+              {{
+                formatFileSize(
+                  backupStatus.legacyArchives.reduce(
+                    (sum, item) => sum + item.sizeBytes,
+                    0,
+                  ),
+                )
+              }}
+            </span>
+            <el-button
+              text
+              type="danger"
+              :disabled="!backupStatus.validBackupCount"
+              @click="cleanupLegacyArchives"
+              >手工清理</el-button
+            >
+          </div>
+          <p class="drawer-help">
+            数据库备份和完整 ZIP 均包含
+            OCR/大模型密钥，请按敏感文件保管。自动备份仅保留最近 5 份有效快照。
+          </p>
         </div>
         <div class="drawer-section">
           <div class="drawer-section-heading">
@@ -5841,7 +6655,7 @@ onUnmounted(() => {
           type="date"
           value-format="YYYY-MM-DD"
           clearable
-          placeholder="按编辑日期筛选"
+          placeholder="按发生日期筛选"
         />
         <el-select v-model="historyStatus" clearable placeholder="全部状态">
           <el-option
@@ -5885,10 +6699,10 @@ onUnmounted(() => {
               >全部文件夹</el-button
             ><span>/</span><strong>{{ historyCurrentFolder?.label }}</strong>
           </div>
-          <div v-if="!historyScopedRecords.length" class="history-empty">
+          <div v-if="!historyResultTotal" class="history-empty">
             <Clock :size="25" /><strong>当前筛选下没有单据</strong>
           </div>
-          <div v-else class="history-list">
+          <div v-else v-loading="isHistoryQueryLoading" class="history-list">
             <article
               v-for="item in pagedHistory"
               :key="item.id"
@@ -5969,13 +6783,13 @@ onUnmounted(() => {
               </div>
             </article>
           </div>
-          <div v-if="historyScopedRecords.length" class="history-pagination">
+          <div v-if="historyResultTotal" class="history-pagination">
             <el-pagination
               v-model:current-page="historyPage"
               v-model:page-size="historyPageSize"
               background
               layout="total, prev, pager, next"
-              :total="historyScopedRecords.length"
+              :total="historyResultTotal"
             />
           </div>
         </template>
@@ -6047,18 +6861,64 @@ onUnmounted(() => {
               v-for="expense in historyPreviewDraft.expenses"
               :key="expense.id"
             >
-              <el-image
-                :src="expense.imageDataUrl"
-                fit="cover"
-                :preview-src-list="[expense.imageDataUrl]"
-              />
-              <el-image
+              <div class="history-preview-image">
+                <el-image
+                  :src="expense.imageDataUrl"
+                  fit="cover"
+                  :preview-src-list="[expense.imageDataUrl]"
+                />
+                <div>
+                  <el-button
+                    text
+                    title="复制原图"
+                    @click="copyOriginalImage(expense)"
+                    ><CopyDocument :size="14"
+                  /></el-button>
+                  <el-button
+                    text
+                    title="另存原图"
+                    @click="saveOriginalImage(expense)"
+                    ><Download :size="14"
+                  /></el-button>
+                  <el-button
+                    text
+                    title="打开所在目录"
+                    @click="openOriginalImageFolder(expense)"
+                    ><Folder :size="14"
+                  /></el-button>
+                </div>
+              </div>
+              <div
                 v-for="attachment in expense.extraAttachments"
                 :key="attachment.id"
-                :src="attachment.imageDataUrl"
-                fit="cover"
-                :preview-src-list="[attachment.imageDataUrl]"
-              />
+                class="history-preview-image"
+              >
+                <el-image
+                  :src="attachment.imageDataUrl"
+                  fit="cover"
+                  :preview-src-list="[attachment.imageDataUrl]"
+                />
+                <div>
+                  <el-button
+                    text
+                    title="复制原图"
+                    @click="copyOriginalImage(attachment)"
+                    ><CopyDocument :size="14"
+                  /></el-button>
+                  <el-button
+                    text
+                    title="另存原图"
+                    @click="saveOriginalImage(attachment)"
+                    ><Download :size="14"
+                  /></el-button>
+                  <el-button
+                    text
+                    title="打开所在目录"
+                    @click="openOriginalImageFolder(attachment)"
+                    ><Folder :size="14"
+                  /></el-button>
+                </div>
+              </div>
             </template>
           </div>
         </template>
@@ -6322,7 +7182,7 @@ onUnmounted(() => {
         <h1>SheepFinance</h1>
         <p>将票据截图识别、核对并排版为报销单的本地桌面工具。</p>
         <div class="about-meta">
-          <span>版本 0.1.8</span><span>Windows 10 x64</span>
+          <span>版本 0.2.0</span><span>Windows 10 x64</span>
         </div>
         <div class="about-links">
           <el-link
@@ -6924,8 +7784,6 @@ h3 {
   height: 42px;
 }
 .paper-editable {
-  min-width: 100%;
-  min-height: 28px;
   max-width: 100%;
   padding: 1px 2px;
   border: 0;
@@ -6934,6 +7792,10 @@ h3 {
   text-align: inherit;
   white-space: inherit;
   user-select: none;
+}
+.paper-table .paper-editable {
+  min-width: 100%;
+  min-height: 28px;
 }
 .paper-select-button {
   display: flex;
@@ -8628,19 +9490,23 @@ h3 {
 }
 .settings-grid .drawer-section:nth-child(1) {
   grid-column: 1 / -1;
-  grid-row: 2;
+  grid-row: 3;
 }
 .settings-grid .drawer-section:nth-child(2) {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+.settings-grid .drawer-section:nth-child(3) {
   grid-column: 1;
   grid-row: 1;
 }
-.settings-grid .drawer-section:nth-child(3) {
+.settings-grid .drawer-section:nth-child(4) {
   grid-column: 2;
   grid-row: 1;
 }
-.settings-grid .drawer-section:nth-child(4) {
+.settings-grid .drawer-section:nth-child(5) {
   grid-column: 1 / -1;
-  grid-row: 3;
+  grid-row: 4;
 }
 .settings-grid .drawer-section:nth-child(1) .el-form-item {
   margin-bottom: 0;
@@ -9031,6 +9897,193 @@ h3 {
 }
 .exporting-document .paper-empty-hint {
   display: none !important;
+}
+.storage-gate {
+  position: fixed;
+  z-index: 9999;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  color: #26352f;
+  background: #eef1ef;
+}
+.storage-gate-panel {
+  width: min(620px, 100%);
+  padding: 34px;
+  border: 1px solid #d7e0db;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 18px 50px rgba(39, 56, 48, 0.13);
+  text-align: center;
+}
+.storage-gate-panel > svg {
+  margin-bottom: 12px;
+  color: #c85f47;
+}
+.storage-gate-panel h1 {
+  margin: 8px 0 10px;
+  font-size: 24px;
+}
+.storage-gate-panel p {
+  margin: 0 0 18px;
+  color: #687a71;
+  line-height: 1.7;
+}
+.storage-spinner {
+  width: 34px;
+  height: 34px;
+  margin: 22px auto 0;
+  border: 3px solid #dfe7e2;
+  border-top-color: #4e7164;
+  border-radius: 50%;
+  animation: storage-spin 0.8s linear infinite;
+}
+@keyframes storage-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.storage-gate-error {
+  color: #a5433c !important;
+  white-space: pre-line;
+}
+.storage-gate-path {
+  padding: 9px 12px;
+  border-radius: 6px;
+  background: #f4f6f5;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.storage-recovery-select {
+  width: 100%;
+  margin-bottom: 16px;
+}
+.storage-gate-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+.storage-file-list {
+  display: grid;
+  gap: 6px;
+  max-height: 180px;
+  margin: 0 0 18px;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid #eadbd6;
+  border-radius: 6px;
+  color: #8c4e42;
+  background: #fff7f4;
+  text-align: left;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.settings-grid .backup-section {
+  grid-column: 1 / -1;
+}
+.backup-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+.backup-summary > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid #dce4df;
+  border-radius: 6px;
+  background: #f8faf8;
+}
+.backup-summary span,
+.backup-summary strong {
+  display: block;
+}
+.backup-summary span {
+  margin-bottom: 4px;
+  color: #7a8981;
+  font-size: 10px;
+}
+.backup-summary strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.backup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.backup-list {
+  display: grid;
+  gap: 7px;
+  max-height: 230px;
+  margin-top: 14px;
+  overflow: auto;
+}
+.backup-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid #e2e8e4;
+  border-radius: 6px;
+}
+.backup-list span,
+.backup-list strong,
+.backup-list small {
+  min-width: 0;
+  display: block;
+}
+.backup-list small {
+  margin-top: 2px;
+  overflow: hidden;
+  color: #809087;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.legacy-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 9px 11px;
+  color: #6f7e76;
+  background: #f6f7f6;
+  font-size: 11px;
+}
+.history-preview-image {
+  position: relative;
+  width: 126px;
+  height: 126px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: #edf1ee;
+}
+.history-preview-image .el-image {
+  width: 100%;
+  height: 100%;
+}
+.history-preview-image > div {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  display: flex;
+  padding: 2px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.9);
+}
+.history-preview-image .el-button {
+  width: 26px;
+  height: 26px;
+  margin: 0;
+  padding: 0;
 }
 @media print {
   .reimbursement-active .paper-scale,

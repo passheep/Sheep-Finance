@@ -1,7 +1,15 @@
-# Tauri + Vue + TypeScript
+# SheepFinance App
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+Tauri 2 + Vue 3 + TypeScript 桌面端代码。生产构建前执行：
 
-## Recommended IDE Setup
+```powershell
+npm run build
+cd src-tauri
+cargo fmt --check
+cargo check --offline
+cargo test --offline
+cd ..
+npm run tauri -- build
+```
 
-- [VS Code](https://code.visualstudio.com/) + [Vue - Official](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+SQLite 数据库和原始图片只写入 `%APPDATA%\com.sheepfinance.app`，不得把真实工作区、API 密钥或完整备份放入仓库。旧 JSON 仅用于 0.1.x 升级迁移兼容，新的业务读写统一通过 `database.rs`、`storage_sql.rs`、`attachments.rs` 和 `backup.rs`。

@@ -1,16 +1,16 @@
 # SheepFinance 开发设计文档
 
-> 文档版本：v0.1  
-> 编制日期：2026-08-07  
-> 当前阶段：需求确认与技术设计  
+> 文档版本：v0.2
+> 编制日期：2026-09-02
+> 当前阶段：0.2.0 本地存储与恢复实现
 > 参考模板：`文档/参考报销单.xlsx`  
 > 模板 SHA-256：`1B1397D8D51AD4121D4B166E044745E5CE4AD61F102619503D989A3462C1BA2A`
 
-## 实现进度注记（2026-08-10）
+## 实现进度注记（2026-09-02）
 
-当前代码已覆盖固定模板工作台、手工编辑、图片排版、Excel 导出、应用内打印、识别命令层和应用数据目录 JSON 持久化。阿里云 OCR 使用 `RecognizeAdvanced`/`RecognizeHandwriting` 两个 Action，并由 Rust 完成 ACS3-HMAC-SHA256 签名；大模型使用 OpenAI 兼容 `chat/completions` 请求。真实密钥、脱敏样本、WPS 打印和 Win10 干净环境尚未联调，因此设计中的准确率、耗时和完整发布验收仍保持未完成状态。
+当前代码已覆盖固定模板工作台、手工编辑、自动续页与附件页、Excel/PDF 导出、应用内打印、识别命令层，以及 SQLite + 本地原图池持久化。阿里云 OCR 使用 `RecognizeAdvanced`/`RecognizeHandwriting` 两个 Action，并由 Rust 完成 ACS3-HMAC-SHA256 签名；大模型使用 OpenAI 兼容 `chat/completions` 请求，可按配置启用多模态图片输入。真实密钥、脱敏样本、WPS 打印和 Win10 干净环境尚未联调，因此设计中的准确率、耗时和完整发布验收仍保持未完成状态。
 
-首版当前明确不承诺：PDF 导出、SQLite 迁移、API 密钥 DPAPI 保护、导出历史查看、WPS 像素级打印一致性。应用打印以右侧 A4 预览为准，Excel 供 WPS 打开、留档和交接。
+0.2.0 已实现 PDF 导出、SQLite 迁移、SQL 历史查询、请求记录、数据库备份和完整备份。当前仍不承诺 API 密钥 DPAPI 保护及 WPS 像素级打印一致性；应用打印以右侧 A4 预览为准，Excel 供 WPS 打开、留档和交接。
 
 ## 1. 项目定位
 
@@ -278,36 +278,37 @@ flowchart LR
 
 ## 8. 本地存储设计
 
-默认数据目录建议使用 `%LOCALAPPDATA%/SheepFinance/`：
+默认数据目录使用 `%APPDATA%\com.sheepfinance.app`：
 
 ```text
-SheepFinance/
-├─ data.db
-├─ records/
-│  └─ {recordId}/
-│     ├─ original/
-│     ├─ processed/
-│     ├─ recognition/
-│     └─ exports/
-├─ logs/
-└─ backups/
+com.sheepfinance.app/
+├─ sheepfinance.db
+├─ images/
+│  └─ <哈希前两位>/<sha256>.<原扩展名>
+├─ backups/
+│  ├─ database/SheepFinance-YYYYMMDD-HHmmss.db
+│  └─ full/
+└─ legacy-json-<时间>/
 ```
 
-建议数据表：
+当前数据表：
 
-- `app_settings`：公司名称、数据目录、通用设置；
-- `reimbursement_profiles`：申请人、部门和收款信息组合对象；
+- `records`：报销单可查询字段及不含图片内容的结构化 JSON；
+- `expenses`：费用明细、排序和 SQL 查询字段；
+- `attachments`、`image_blobs`：附件关系和不可变原图元数据；
+- `profiles`：申请人、部门和收款信息组合对象；
 - `dictionary_items`：事由、安排人等字典；
 - `ocr_profiles`：OCR 配置；
 - `llm_profiles`：大模型配置；
-- `reimbursement_records`：报销单主记录；
-- `expense_items`：费用项；
-- `attachments`：图片及排版数据；
-- `recognition_runs`：OCR/AI 请求状态、耗时和原始结果路径；
-- `export_history`：导出格式、路径、时间和结果；
-- `operation_logs`：关键业务操作。
+- `ui_preferences`：费用列表宽度、历史展示方式等界面设置；
+- `request_logs`：OCR/大模型请求地址、时间、耗时、脱敏请求和响应；
+- `app_meta`：当前单据、存储版本和迁移状态。
 
-原图和原始响应适合存文件，SQLite 保存索引、状态和相对路径，避免数据库无限膨胀。保存记录时采用事务；应用异常退出后能够恢复最近草稿。
+数据库启用 WAL、外键、`synchronous=FULL` 和忙等待，自动保存及设置修改在同一事务中提交。图片先写临时文件、校验 SHA-256 后原子启用，再由事务建立附件引用；相同原图只保存一份。OCR 和多模态请求只向前端接收附件编号，由 Rust 读取本地文件，图片 Base64 不进入数据库或单据 JSON。
+
+首次升级时优先读取 `workspace.json`，失败回退 `workspace.bak`；`records/` 下每份单据独立读取并回退同名 `.bak`。迁移在临时数据库和临时图片池完成，数量、外键、图片哈希和 `quick_check` 校验通过后才启用。任一单据主文件及备份均损坏时停止迁移；设置均损坏时仅在用户确认后使用默认设置恢复可读单据。旧 JSON 成功迁移后归档，至少存在一份有效数据库备份前不允许清理。
+
+每次启动检查数据库与引用图片。主数据库损坏或缺失但存在备份时，不创建空数据库，而是进入恢复界面。距最近有效数据库快照满 72 小时会后台使用 SQLite Online Backup API 创建新快照，通过完整性及图片引用检查后才轮换第 6 份。自动快照仅包含数据库并依赖本机不可变图片池；完整 ZIP 另外包含全部引用图片和 SHA-256 清单，用于跨机器恢复。
 
 ## 9. Excel、PDF 与打印
 

@@ -10,7 +10,10 @@ use tauri::AppHandle;
 use time::{macros::format_description, OffsetDateTime};
 use uuid::Uuid;
 
-use crate::request_log::{append_request_log, now_iso8601, RequestLogInput};
+use crate::{
+    database,
+    request_log::{append_request_log, now_iso8601, RequestLogInput},
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -37,14 +40,10 @@ pub struct RecognitionRequest {
     pub record_id: String,
     #[serde(default)]
     pub expense_id: String,
-    #[serde(default)]
-    pub file_name: String,
-    pub image_data_url: String,
+    pub attachment_id: String,
     pub ocr_mode: OcrMode,
-    pub ocr_profile: OcrProfile,
-    pub llm_profile: LlmProfile,
-    #[serde(default)]
-    pub reason_dictionary: Vec<String>,
+    pub ocr_profile_id: Option<String>,
+    pub llm_profile_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,16 +131,61 @@ pub async fn recognize_expense(
     app: AppHandle,
     request: RecognitionRequest,
 ) -> Result<RecognitionResponse, String> {
-    validate_request(&request)?;
+    database::validate_record_id(&request.record_id)?;
+    database::validate_record_id(&request.expense_id)?;
+    database::validate_record_id(&request.attachment_id)?;
+    let root = database::storage_root(&app)?;
+    let attachment_id = request.attachment_id.clone();
+    let ocr_profile_id = request.ocr_profile_id.clone();
+    let llm_profile_id = request.llm_profile_id.clone();
+    let stored = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = database::storage_guard()?;
+        let connection = database::open_database(&root, false)?;
+        let ocr_profile = serde_json::from_value::<OcrProfile>(database::load_profile_json(
+            &connection,
+            "ocr_profiles",
+            ocr_profile_id.as_deref(),
+        )?)
+        .map_err(|error| format!("解析 OCR 配置失败：{error}"))?;
+        let llm_profile = serde_json::from_value::<LlmProfile>(database::load_profile_json(
+            &connection,
+            "llm_profiles",
+            llm_profile_id.as_deref(),
+        )?)
+        .map_err(|error| format!("解析大模型配置失败：{error}"))?;
+        let reason_dictionary = database::load_dictionary_values(&connection, "reason")?;
+        let (blob_hash, file_name) = database::recognition_blob(&connection, &attachment_id)?;
+        let path = database::image_path_for_hash(&connection, &root, &blob_hash)?;
+        let image = std::fs::read(&path).map_err(|error| format!("读取识别图片失败：{error}"))?;
+        if image.is_empty() {
+            return Err("识别图片内容为空".to_string());
+        }
+        if image.len() > MAX_IMAGE_BYTES {
+            return Err("识别图片超过 10 MB，请删除后重新上传".to_string());
+        }
+        let (mime_type, _) = database::detect_image_type(&image)?;
+        Ok::<_, String>((
+            ocr_profile,
+            llm_profile,
+            reason_dictionary,
+            image,
+            mime_type.to_string(),
+            file_name,
+        ))
+    })
+    .await
+    .map_err(|_| "识别图片读取任务异常结束".to_string())??;
+    let (ocr_profile, llm_profile, reason_dictionary, image, mime_type, file_name) = stored;
+    validate_profiles(&ocr_profile, &llm_profile)?;
     let context = RequestContext {
         app,
         record_id: request.record_id.clone(),
         expense_id: request.expense_id.clone(),
-        file_name: request.file_name.clone(),
+        file_name,
     };
-    let image = decode_image_data_url(&request.image_data_url)?;
+    let image_data_url = format!("data:{mime_type};base64,{}", BASE64.encode(&image));
     let ocr_started = Instant::now();
-    let ocr_text = call_aliyun_ocr(&context, &request.ocr_profile, request.ocr_mode, image).await?;
+    let ocr_text = call_aliyun_ocr(&context, &ocr_profile, request.ocr_mode, image).await?;
     let ocr_elapsed_ms = ocr_started.elapsed().as_millis();
 
     if ocr_text.trim().is_empty() {
@@ -151,10 +195,10 @@ pub async fn recognize_expense(
     let llm_started = Instant::now();
     let extraction = call_llm(
         &context,
-        &request.llm_profile,
+        &llm_profile,
         &ocr_text,
-        &request.reason_dictionary,
-        &request.image_data_url,
+        &reason_dictionary,
+        &image_data_url,
     )
     .await;
     let llm_elapsed_ms = llm_started.elapsed().as_millis();
@@ -167,8 +211,8 @@ pub async fn recognize_expense(
         ocr_text,
         llm_text,
         extracted,
-        ocr_profile_name: request.ocr_profile.name,
-        llm_profile_name: request.llm_profile.name,
+        ocr_profile_name: ocr_profile.name,
+        llm_profile_name: llm_profile.name,
         ocr_elapsed_ms,
         llm_elapsed_ms,
         llm_error,
@@ -179,19 +223,19 @@ fn default_timeout_seconds() -> u64 {
     30
 }
 
-fn validate_request(request: &RecognitionRequest) -> Result<(), String> {
-    if request.ocr_profile.access_key_id.trim().is_empty()
-        || request.ocr_profile.access_key_secret.trim().is_empty()
+fn validate_profiles(ocr_profile: &OcrProfile, llm_profile: &LlmProfile) -> Result<(), String> {
+    if ocr_profile.access_key_id.trim().is_empty()
+        || ocr_profile.access_key_secret.trim().is_empty()
     {
         return Err("请先填写阿里云 OCR 的 AccessKey ID 和 AccessKey Secret".to_string());
     }
-    if request.llm_profile.api_key.trim().is_empty() || request.llm_profile.model.trim().is_empty()
-    {
+    if llm_profile.api_key.trim().is_empty() || llm_profile.model.trim().is_empty() {
         return Err("请先填写大模型 API Key 和模型名称".to_string());
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_image_data_url(data_url: &str) -> Result<Vec<u8>, String> {
     let (metadata, content) = data_url
         .split_once(',')
