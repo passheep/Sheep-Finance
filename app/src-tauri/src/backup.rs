@@ -17,9 +17,9 @@ use uuid::Uuid;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::database::{
-    self, database_path, image_manifest, referenced_hashes, BACKUP_INTERVAL_SECONDS,
-    DATABASE_BACKUP_DIRECTORY, DATABASE_FILE, FULL_BACKUP_DIRECTORY, IMAGE_DIRECTORY,
-    MAX_DATABASE_BACKUPS,
+    self, database_path, image_manifest, referenced_hashes, referenced_image_paths,
+    BACKUP_INTERVAL_SECONDS, DATABASE_BACKUP_DIRECTORY, DATABASE_FILE, FULL_BACKUP_DIRECTORY,
+    IMAGE_DIRECTORY, MAX_DATABASE_BACKUPS,
 };
 
 static BACKUP_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -662,6 +662,7 @@ fn merge_imported_images(source: &Path, target: &Path) -> Result<(), String> {
 fn cleanup_orphan_images_at_root(root: &Path) -> Result<u64, String> {
     let connection = database::open_database(root, false)?;
     let mut retained = referenced_hashes(&connection)?;
+    let mut retained_paths = referenced_image_paths(&connection)?;
     drop(connection);
     for backup in list_database_backups(root)?
         .into_iter()
@@ -670,19 +671,18 @@ fn cleanup_orphan_images_at_root(root: &Path) -> Result<u64, String> {
     {
         let connection = database::open_database_readonly_at(Path::new(&backup.path))?;
         retained.extend(referenced_hashes(&connection)?);
+        retained_paths.extend(referenced_image_paths(&connection)?);
     }
     let connection = database::open_database(root, false)?;
     let manifest = image_manifest(&connection)?;
     let mut reclaimed = 0u64;
     for path in image_pool_files(&root.join(IMAGE_DIRECTORY))? {
-        let Some(hash) = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .filter(|value| database::validate_hash(value).is_ok())
-        else {
-            continue;
-        };
-        if retained.contains(hash) {
+        let relative_path = path
+            .strip_prefix(root)
+            .map_err(|_| "图片路径超出应用数据目录".to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if retained_paths.contains(&relative_path) {
             continue;
         }
         reclaimed =
@@ -895,7 +895,7 @@ mod tests {
         let connection = open_database(&root, true).unwrap();
         initialize_schema(&connection).unwrap();
         let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 3, 2, 1];
-        let blob = database::store_image_bytes(&root, &bytes, 10, 10).unwrap();
+        let blob = database::store_image_bytes(&root, "broken-current", &bytes, 10, 10).unwrap();
         database::insert_blob(&connection, &blob).unwrap();
         drop(connection);
         database::save_workspace_at_root(
@@ -994,7 +994,7 @@ mod tests {
         initialize_schema(&connection).unwrap();
         drop(connection);
         let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 9, 8, 7];
-        let blob = database::store_image_bytes(&root, &bytes, 1, 1).unwrap();
+        let blob = database::store_image_bytes(&root, "record-orphan", &bytes, 1, 1).unwrap();
         let path = root.join(
             blob.relative_path
                 .replace('/', std::path::MAIN_SEPARATOR_STR),
@@ -1038,13 +1038,13 @@ mod tests {
     }
 
     #[test]
-    fn orphan_image_is_retained_while_database_backup_references_it() {
+    fn image_cleanup_retains_only_paths_referenced_by_current_and_backup_databases() {
         let root = temporary_root("gc");
         fs::create_dir_all(&root).unwrap();
         let connection = open_database(&root, true).unwrap();
         initialize_schema(&connection).unwrap();
         let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 4, 5, 6];
-        let blob = database::store_image_bytes(&root, &bytes, 10, 10).unwrap();
+        let blob = database::store_image_bytes(&root, "record-gc", &bytes, 10, 10).unwrap();
         database::insert_blob(&connection, &blob).unwrap();
         drop(connection);
         database::save_workspace_at_root(
@@ -1066,14 +1066,31 @@ mod tests {
             },
         )
         .unwrap();
-        let backup = create_database_backup_at_root(&root).unwrap();
-        database::delete_record_at_root(&root, "record-gc").unwrap();
-        cleanup_orphan_images_at_root(&root).unwrap();
         let image_path = root.join(
             blob.relative_path
                 .replace('/', std::path::MAIN_SEPARATOR_STR),
         );
+        let unrelated_current_path = root.join(format!(
+            "images/record-unreferenced-current/{}.png",
+            blob.hash
+        ));
+        fs::create_dir_all(unrelated_current_path.parent().unwrap()).unwrap();
+        fs::copy(&image_path, &unrelated_current_path).unwrap();
+        cleanup_orphan_images_at_root(&root).unwrap();
         assert!(image_path.exists());
+        assert!(!unrelated_current_path.exists());
+
+        let backup = create_database_backup_at_root(&root).unwrap();
+        database::delete_record_at_root(&root, "record-gc").unwrap();
+        let unrelated_backup_path = root.join(format!(
+            "images/record-unreferenced-backup/{}.png",
+            blob.hash
+        ));
+        fs::create_dir_all(unrelated_backup_path.parent().unwrap()).unwrap();
+        fs::copy(&image_path, &unrelated_backup_path).unwrap();
+        cleanup_orphan_images_at_root(&root).unwrap();
+        assert!(image_path.exists());
+        assert!(!unrelated_backup_path.exists());
         fs::remove_file(backup.path).unwrap();
         cleanup_orphan_images_at_root(&root).unwrap();
         assert!(!image_path.exists());
@@ -1089,7 +1106,8 @@ mod tests {
         let connection = open_database(&source_root, true).unwrap();
         initialize_schema(&connection).unwrap();
         let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 7, 8, 9];
-        let blob = database::store_image_bytes(&source_root, &bytes, 20, 20).unwrap();
+        let blob =
+            database::store_image_bytes(&source_root, "record-full", &bytes, 20, 20).unwrap();
         database::insert_blob(&connection, &blob).unwrap();
         drop(connection);
         database::save_workspace_at_root(

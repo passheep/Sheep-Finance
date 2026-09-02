@@ -1719,6 +1719,7 @@ function applyStoredAttachment(
   }
 }
 async function persistImage(
+  recordId: string,
   imageDataUrl: string,
   recognitionDataUrl: string | undefined,
   width: number,
@@ -1726,6 +1727,7 @@ async function persistImage(
 ) {
   return invoke<StoredAttachment>("store_attachment", {
     request: {
+      recordId,
       dataUrl: imageDataUrl,
       recognitionDataUrl,
       naturalWidth: width,
@@ -1809,6 +1811,7 @@ async function addFile(file: File, notify = true, targetRecordId = draft.id) {
     );
     const stored = isTauriRuntime()
       ? await persistImage(
+          targetRecordId,
           image.dataUrl,
           recognitionImageDataUrl,
           image.width,
@@ -1928,7 +1931,13 @@ async function addExtraAttachmentFile(
   try {
     const image = await readImage(file);
     const stored = isTauriRuntime()
-      ? await persistImage(image.dataUrl, undefined, image.width, image.height)
+      ? await persistImage(
+          targetRecordId,
+          image.dataUrl,
+          undefined,
+          image.width,
+          image.height,
+        )
       : null;
     const current = draft.expenses.find((item) => item.id === expenseId);
     if (
@@ -3083,9 +3092,9 @@ async function refreshHistoryQuery() {
   try {
     const result = await invoke<HistoryQueryResult>("query_history", {
       query: {
-        keyword: historySearch.value.trim(),
-        date: historyDate.value,
-        status: historyStatus.value,
+        keyword: (historySearch.value ?? "").trim(),
+        date: historyDate.value ?? "",
+        status: historyStatus.value ?? "",
         folderKind:
           historyViewMode.value === "list" ? "" : historyViewMode.value,
         folderKey:
@@ -3966,10 +3975,14 @@ async function openOriginalImageFolder(
     | ExtraAttachment
     | Expense
     | null = selectedAttachment.value,
+  recordId = draft.id,
 ) {
   if (!attachment?.blobHash) return;
   try {
-    await invoke("open_attachment_folder", { blobHash: attachment.blobHash });
+    await invoke("open_attachment_folder", {
+      blobHash: attachment.blobHash,
+      recordId,
+    });
   } catch (error) {
     ElMessage.error(errorMessage(error));
   }
@@ -6225,7 +6238,7 @@ onUnmounted(() => {
           </div>
           <div v-if="backupStatus?.backups.length" class="backup-list">
             <div v-for="item in backupStatus.backups" :key="item.fileName">
-              <span>
+              <span class="backup-list-main">
                 <strong>{{ formatDateTime(item.createdAt) }}</strong>
                 <small
                   >{{ formatFileSize(item.sizeBytes) }} ·
@@ -6817,10 +6830,12 @@ onUnmounted(() => {
               </p>
               <small class="history-preview-meta">
                 申请人：{{ historyPreviewDraft.applicant || "未填写" }} ·
-                所属部门：{{ historyPreviewDraft.department || "未填写" }} ·
-                报销日期：{{
-                  historyPreviewDraft.reimbursementDate || "未填写"
-                }}
+                所属部门：{{ historyPreviewDraft.department || "未填写" }}
+                <template v-if="historyPreviewDraft.reimbursementDate">
+                  · 报销日期：{{ historyPreviewDraft.reimbursementDate }}
+                </template>
+                <br />
+                报销单编号：{{ historyPreviewDraft.id }}
               </small>
             </div>
             <el-tag :type="reimbursementStatusType(historyPreviewItem.status)">
@@ -6867,7 +6882,7 @@ onUnmounted(() => {
                   fit="cover"
                   :preview-src-list="[expense.imageDataUrl]"
                 />
-                <div>
+                <div class="history-preview-image-actions">
                   <el-button
                     text
                     title="复制原图"
@@ -6883,7 +6898,9 @@ onUnmounted(() => {
                   <el-button
                     text
                     title="打开所在目录"
-                    @click="openOriginalImageFolder(expense)"
+                    @click="
+                      openOriginalImageFolder(expense, historyPreviewDraft.id)
+                    "
                     ><Folder :size="14"
                   /></el-button>
                 </div>
@@ -6898,7 +6915,7 @@ onUnmounted(() => {
                   fit="cover"
                   :preview-src-list="[attachment.imageDataUrl]"
                 />
-                <div>
+                <div class="history-preview-image-actions">
                   <el-button
                     text
                     title="复制原图"
@@ -6914,7 +6931,12 @@ onUnmounted(() => {
                   <el-button
                     text
                     title="打开所在目录"
-                    @click="openOriginalImageFolder(attachment)"
+                    @click="
+                      openOriginalImageFolder(
+                        attachment,
+                        historyPreviewDraft.id,
+                      )
+                    "
                     ><Folder :size="14"
                   /></el-button>
                 </div>
@@ -7182,7 +7204,7 @@ onUnmounted(() => {
         <h1>SheepFinance</h1>
         <p>将票据截图识别、核对并排版为报销单的本地桌面工具。</p>
         <div class="about-meta">
-          <span>版本 0.2.0</span><span>Windows 10 x64</span>
+          <span>版本 0.2.1</span><span>Windows 10 x64</span>
         </div>
         <div class="about-links">
           <el-link
@@ -8365,18 +8387,11 @@ h3 {
 }
 .history-preview-attachments {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(82px, 1fr));
+  grid-template-columns: repeat(auto-fill, 126px);
   gap: 8px;
   max-height: 150px;
   margin-top: 14px;
   overflow: auto;
-}
-.history-preview-attachments .el-image {
-  width: 82px;
-  height: 82px;
-  border: 1px solid #d7e1da;
-  border-radius: 5px;
-  background: #f1f4f1;
 }
 .history-item {
   display: flex;
@@ -10033,19 +10048,25 @@ h3 {
   border: 1px solid #e2e8e4;
   border-radius: 6px;
 }
-.backup-list span,
-.backup-list strong,
-.backup-list small {
+.backup-list-main,
+.backup-list-main strong,
+.backup-list-main small {
   min-width: 0;
   display: block;
 }
-.backup-list small {
+.backup-list-main small {
   margin-top: 2px;
   overflow: hidden;
   color: #809087;
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.backup-list .el-tag {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .legacy-summary {
   display: flex;
@@ -10061,17 +10082,22 @@ h3 {
 .history-preview-image {
   position: relative;
   width: 126px;
-  height: 126px;
+  aspect-ratio: 1;
   overflow: hidden;
   border-radius: 6px;
   background: #edf1ee;
 }
 .history-preview-image .el-image {
+  box-sizing: border-box;
+  display: block;
   width: 100%;
   height: 100%;
+  border: 1px solid #d7e1da;
+  border-radius: 6px;
 }
-.history-preview-image > div {
+.history-preview-image-actions {
   position: absolute;
+  z-index: 1;
   right: 4px;
   bottom: 4px;
   display: flex;

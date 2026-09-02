@@ -9,7 +9,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
@@ -199,15 +199,15 @@ pub struct LoadedWorkspace {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub keyword: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub date: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub folder_kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub folder_key: String,
     #[serde(default = "default_page")]
     pub page: usize,
@@ -243,6 +243,13 @@ fn default_page() -> usize {
 
 fn default_page_size() -> usize {
     20
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 pub fn storage_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -394,13 +401,14 @@ pub fn bootstrap_at_root(
             validate_referenced_images(root, &connection, true)
         }) {
             Ok(()) => {
+                let image_organization_warning = organize_images_by_record_at_root(root).err();
                 let migrated_legacy_remains = open_database_readonly_at(&database)
                     .and_then(|connection| get_meta(&connection, "legacy_migrated_at"))
                     .ok()
                     .flatten()
                     .is_some()
                     && legacy_data_exists(root);
-                let message = if migrated_legacy_remains {
+                let mut message = if migrated_legacy_remains {
                     archive_legacy_json(root).map_or_else(
                         |error| format!("本地数据库已就绪，但旧 JSON 归档未完成：{error}"),
                         |_| "本地数据库已就绪，已完成中断的旧 JSON 归档".to_string(),
@@ -408,6 +416,9 @@ pub fn bootstrap_at_root(
                 } else {
                     "本地数据库已就绪".to_string()
                 };
+                if let Some(error) = image_organization_warning {
+                    message.push_str(&format!("，但按单据整理图片失败：{error}"));
+                }
                 BootstrapResult {
                     status: "ready".to_string(),
                     message,
@@ -724,6 +735,14 @@ fn migrate_legacy(
                 .map_err(|error| format!("提交单据迁移失败：{error}"))?;
         }
 
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("开启迁移图片整理事务失败：{error}"))?;
+        organize_images_by_record_tx(&staging, &transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交迁移图片整理失败：{error}"))?;
+
         migrate_request_logs(&mut connection, root)?;
         if let Some(workspace) = workspace.as_ref() {
             let current = workspace
@@ -919,6 +938,7 @@ fn read_json(path: &Path) -> Result<Value, String> {
 }
 
 fn convert_legacy_record_images(root: &Path, record: &mut Value) -> Result<usize, String> {
+    let record_id = required_id(record.get("id"), "旧版单据")?.to_string();
     let expenses = record
         .get_mut("expenses")
         .and_then(Value::as_array_mut)
@@ -936,7 +956,7 @@ fn convert_legacy_record_images(root: &Path, record: &mut Value) -> Result<usize
         {
             let width = json_u32(object.get("naturalWidth"));
             let height = json_u32(object.get("naturalHeight"));
-            let original = store_data_url_blob(root, &data_url, width, height)?;
+            let original = store_data_url_blob(root, &record_id, &data_url, width, height)?;
             apply_blob_metadata(object, &original, "");
             count += 1;
 
@@ -948,7 +968,8 @@ fn convert_legacy_record_images(root: &Path, record: &mut Value) -> Result<usize
                     .filter(|value| !value.is_empty() && *value != data_url)
                     .map(str::to_string)
                 {
-                    let recognition = store_data_url_blob(root, &recognition_url, width, height)?;
+                    let recognition =
+                        store_data_url_blob(root, &record_id, &recognition_url, width, height)?;
                     if recognition.hash != original.hash {
                         apply_blob_metadata(object, &recognition, "recognition");
                     }
@@ -974,7 +995,7 @@ fn convert_legacy_record_images(root: &Path, record: &mut Value) -> Result<usize
                 {
                     let width = json_u32(attachment_object.get("naturalWidth"));
                     let height = json_u32(attachment_object.get("naturalHeight"));
-                    let blob = store_data_url_blob(root, &data_url, width, height)?;
+                    let blob = store_data_url_blob(root, &record_id, &data_url, width, height)?;
                     apply_blob_metadata(attachment_object, &blob, "");
                     count += 1;
                 }
@@ -994,19 +1015,30 @@ fn json_u32(value: Option<&Value>) -> u32 {
 
 fn apply_blob_metadata(object: &mut Map<String, Value>, blob: &BlobMetadata, prefix: &str) {
     let names = if prefix.is_empty() {
-        ("blobHash", "mimeType", "blobExtension", "sizeBytes")
+        (
+            "blobHash",
+            "mimeType",
+            "blobExtension",
+            "sizeBytes",
+            "blobRelativePath",
+        )
     } else {
         (
             "recognitionBlobHash",
             "recognitionMimeType",
             "recognitionBlobExtension",
             "recognitionSizeBytes",
+            "recognitionBlobRelativePath",
         )
     };
     object.insert(names.0.to_string(), Value::String(blob.hash.clone()));
     object.insert(names.1.to_string(), Value::String(blob.mime_type.clone()));
     object.insert(names.2.to_string(), Value::String(blob.extension.clone()));
     object.insert(names.3.to_string(), Value::from(blob.size_bytes));
+    object.insert(
+        names.4.to_string(),
+        Value::String(blob.relative_path.clone()),
+    );
 }
 
 pub fn decode_image_data_url(data_url: &str) -> Result<(Vec<u8>, String), String> {
@@ -1051,13 +1083,15 @@ pub fn detect_image_type(bytes: &[u8]) -> Result<(&'static str, &'static str), S
 
 pub fn store_image_bytes(
     root: &Path,
+    record_id: &str,
     bytes: &[u8],
     width: u32,
     height: u32,
 ) -> Result<BlobMetadata, String> {
+    validate_record_id(record_id)?;
     let (mime_type, extension) = detect_image_type(bytes)?;
     let hash = hex::encode(Sha256::digest(bytes));
-    let relative_path = format!("{IMAGE_DIRECTORY}/{}/{}.{}", &hash[..2], hash, extension);
+    let relative_path = record_image_relative_path(record_id, &hash, extension)?;
     let final_path = root.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
     if final_path.exists() {
         let stored = fs::read(&final_path).map_err(|error| format!("读取已存图片失败：{error}"))?;
@@ -1103,12 +1137,13 @@ pub fn store_image_bytes(
 
 fn store_data_url_blob(
     root: &Path,
+    record_id: &str,
     data_url: &str,
     width: u32,
     height: u32,
 ) -> Result<BlobMetadata, String> {
     let (bytes, _) = decode_image_data_url(data_url)?;
-    store_image_bytes(root, &bytes, width, height)
+    store_image_bytes(root, record_id, &bytes, width, height)
 }
 
 pub fn insert_blob(connection: &Connection, blob: &BlobMetadata) -> Result<(), String> {
@@ -1169,26 +1204,216 @@ pub fn validate_blob_relative_path(
     if !matches!(extension, "jpg" | "png" | "gif" | "webp" | "bmp") {
         return Err("图片扩展名无效".to_string());
     }
-    let expected = format!("{IMAGE_DIRECTORY}/{}/{}.{}", &hash[..2], hash, extension);
-    if relative_path == expected {
+    let legacy = format!("{IMAGE_DIRECTORY}/{}/{}.{}", &hash[..2], hash, extension);
+    let parts = relative_path.split('/').collect::<Vec<_>>();
+    let record_path_valid = parts.len() == 3
+        && parts[0] == IMAGE_DIRECTORY
+        && validate_record_id(parts[1]).is_ok()
+        && parts[2] == format!("{hash}.{extension}");
+    if relative_path == legacy || record_path_valid {
         Ok(())
     } else {
         Err("图片存储路径与哈希不匹配".to_string())
     }
 }
 
+pub fn record_image_relative_path(
+    record_id: &str,
+    hash: &str,
+    extension: &str,
+) -> Result<String, String> {
+    validate_record_id(record_id)?;
+    validate_hash(hash)?;
+    if !matches!(extension, "jpg" | "png" | "gif" | "webp" | "bmp") {
+        return Err("图片扩展名无效".to_string());
+    }
+    Ok(format!("{IMAGE_DIRECTORY}/{record_id}/{hash}.{extension}"))
+}
+
 pub fn ensure_path_inside(root: &Path, path: &Path) -> Result<(), String> {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let parent = path
-        .parent()
-        .unwrap_or(path)
+    let root = root
         .canonicalize()
-        .unwrap_or_else(|_| path.parent().unwrap_or(path).to_path_buf());
-    if parent.starts_with(&root) {
+        .map_err(|error| format!("规范化应用数据目录失败：{error}"))?;
+    let mut existing_ancestor = if path.exists() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor
+            .parent()
+            .ok_or_else(|| "文件路径缺少有效父目录".to_string())?;
+    }
+    let existing_ancestor = existing_ancestor
+        .canonicalize()
+        .map_err(|error| format!("规范化文件路径失败：{error}"))?;
+    if existing_ancestor.starts_with(&root) {
         Ok(())
     } else {
         Err("文件路径超出应用数据目录".to_string())
     }
+}
+
+fn record_image_links(
+    connection: &Connection,
+) -> Result<Vec<(String, String, String, String)>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT e.record_id, b.hash, b.relative_path, b.extension
+             FROM attachments a
+             JOIN expenses e ON e.id=a.expense_id
+             JOIN image_blobs b ON b.hash=a.blob_hash
+             UNION
+             SELECT DISTINCT e.record_id, b.hash, b.relative_path, b.extension
+             FROM attachments a
+             JOIN expenses e ON e.id=a.expense_id
+             JOIN image_blobs b ON b.hash=a.recognition_blob_hash
+             WHERE a.recognition_blob_hash IS NOT NULL
+             ORDER BY 1, 2",
+        )
+        .map_err(|error| format!("准备单据图片目录查询失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(|error| format!("查询单据图片目录失败：{error}"))?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(result)
+}
+
+fn materialize_record_image(source: &Path, target: &Path, hash: &str) -> Result<(), String> {
+    if source == target {
+        return Ok(());
+    }
+    if target.exists() {
+        let bytes = fs::read(target).map_err(|error| format!("读取单据图片失败：{error}"))?;
+        if hex::encode(Sha256::digest(&bytes)) == hash {
+            return Ok(());
+        }
+        return Err(format!("单据图片文件内容冲突：{}", target.display()));
+    }
+
+    let source_bytes = fs::read(source).map_err(|error| format!("读取原始图片失败：{error}"))?;
+    if hex::encode(Sha256::digest(&source_bytes)) != hash {
+        return Err(format!("原始图片哈希错误：{}", source.display()));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| "单据图片目录无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建单据图片目录失败：{error}"))?;
+    let temporary = parent.join(format!(".{hash}.{}.tmp", Uuid::new_v4().simple()));
+    if fs::hard_link(source, &temporary).is_err() {
+        let mut file =
+            fs::File::create(&temporary).map_err(|error| format!("创建单据图片失败：{error}"))?;
+        let write_result = file.write_all(&source_bytes).and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("写入单据图片失败：{error}"));
+        }
+    }
+    if let Err(error) = fs::rename(&temporary, target) {
+        let _ = fs::remove_file(&temporary);
+        if !target.exists() {
+            return Err(format!("提交单据图片失败：{error}"));
+        }
+        let bytes = fs::read(target).map_err(|read_error| read_error.to_string())?;
+        if hex::encode(Sha256::digest(&bytes)) != hash {
+            return Err(format!("单据图片文件内容冲突：{}", target.display()));
+        }
+    }
+    Ok(())
+}
+
+fn organize_images_by_record_tx(root: &Path, transaction: &Transaction<'_>) -> Result<(), String> {
+    let mut groups = HashMap::<String, (String, String, BTreeSet<String>)>::new();
+    for (record_id, hash, relative_path, extension) in record_image_links(transaction)? {
+        validate_record_id(&record_id)?;
+        validate_blob_relative_path(&hash, &extension, &relative_path)?;
+        let entry = groups
+            .entry(hash)
+            .or_insert_with(|| (relative_path, extension, BTreeSet::new()));
+        entry.2.insert(record_id);
+    }
+
+    for (hash, (current_relative_path, extension, record_ids)) in groups {
+        let source = root.join(current_relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        ensure_path_inside(root, &source)?;
+        let mut preferred_relative_path = None;
+        for record_id in record_ids {
+            let relative_path = record_image_relative_path(&record_id, &hash, &extension)?;
+            let target = root.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            ensure_path_inside(root, &target)?;
+            materialize_record_image(&source, &target, &hash)?;
+            if current_relative_path == relative_path || preferred_relative_path.is_none() {
+                preferred_relative_path = Some(relative_path);
+            }
+        }
+        if let Some(relative_path) = preferred_relative_path {
+            if relative_path != current_relative_path {
+                transaction
+                    .execute(
+                        "UPDATE image_blobs SET relative_path=?1 WHERE hash=?2",
+                        params![relative_path, hash],
+                    )
+                    .map_err(|error| format!("更新单据图片目录失败：{error}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn organize_images_by_record_at_root(root: &Path) -> Result<(), String> {
+    let mut connection = open_database(root, false)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开启单据图片整理事务失败：{error}"))?;
+    organize_images_by_record_tx(root, &transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交单据图片整理失败：{error}"))
+}
+
+pub fn record_image_path_for_hash(
+    connection: &Connection,
+    root: &Path,
+    record_id: &str,
+    hash: &str,
+) -> Result<PathBuf, String> {
+    validate_record_id(record_id)?;
+    validate_hash(hash)?;
+    let referenced: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM attachments a
+                JOIN expenses e ON e.id=a.expense_id
+                WHERE e.record_id=?1 AND (a.blob_hash=?2 OR a.recognition_blob_hash=?2)
+             )",
+            params![record_id, hash],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("检查单据图片关系失败：{error}"))?;
+    if !referenced {
+        return Err("该图片不属于指定报销单".to_string());
+    }
+    let (source_relative_path, extension): (String, String) = connection
+        .query_row(
+            "SELECT relative_path, extension FROM image_blobs WHERE hash=?1",
+            [hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| "图片文件引用不存在".to_string())?;
+    validate_blob_relative_path(hash, &extension, &source_relative_path)?;
+    let source = root.join(source_relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    ensure_path_inside(root, &source)?;
+    let target_relative_path = record_image_relative_path(record_id, hash, &extension)?;
+    let target = root.join(target_relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    ensure_path_inside(root, &target)?;
+    materialize_record_image(&source, &target, hash)?;
+    Ok(target)
 }
 
 pub fn save_workspace_at_root(root: &Path, request: SaveWorkspaceRequest) -> Result<(), String> {
@@ -1212,6 +1437,7 @@ pub fn save_workspace_at_root(root: &Path, request: SaveWorkspaceRequest) -> Res
             .ok_or_else(|| "报销单缺少记录编号".to_string())?;
         set_meta_tx(&transaction, "current_record_id", record_id)?;
         set_meta_tx(&transaction, "storage_version", "2")?;
+        organize_images_by_record_tx(root, &transaction)?;
     }
     transaction
         .commit()
@@ -1440,13 +1666,14 @@ fn ensure_blob_row_from_object(
     if existing {
         return Ok(());
     }
-    let (mime_key, extension_key, size_key) = if prefix.is_empty() {
-        ("mimeType", "blobExtension", "sizeBytes")
+    let (mime_key, extension_key, size_key, relative_path_key) = if prefix.is_empty() {
+        ("mimeType", "blobExtension", "sizeBytes", "blobRelativePath")
     } else {
         (
             "recognitionMimeType",
             "recognitionBlobExtension",
             "recognitionSizeBytes",
+            "recognitionBlobRelativePath",
         )
     };
     let mime_type = object
@@ -1457,7 +1684,12 @@ fn ensure_blob_row_from_object(
         .get(extension_key)
         .and_then(Value::as_str)
         .unwrap_or_else(|| extension_for_mime(mime_type));
-    let relative_path = format!("{IMAGE_DIRECTORY}/{}/{}.{}", &hash[..2], hash, extension);
+    let relative_path = object
+        .get(relative_path_key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{IMAGE_DIRECTORY}/{}/{}.{}", &hash[..2], hash, extension));
+    validate_blob_relative_path(hash, extension, &relative_path)?;
     transaction
         .execute(
             "INSERT INTO image_blobs
@@ -2158,6 +2390,22 @@ pub fn referenced_hashes(connection: &Connection) -> Result<BTreeSet<String>, St
     Ok(result)
 }
 
+pub fn referenced_image_paths(connection: &Connection) -> Result<BTreeSet<String>, String> {
+    let manifest = image_manifest(connection)?;
+    let mut paths = BTreeSet::new();
+    for hash in referenced_hashes(connection)? {
+        let blob = manifest
+            .get(&hash)
+            .ok_or_else(|| format!("数据库缺少图片元数据：{hash}"))?;
+        validate_blob_relative_path(&hash, &blob.extension, &blob.relative_path)?;
+        paths.insert(blob.relative_path.clone());
+    }
+    for (record_id, hash, _, extension) in record_image_links(connection)? {
+        paths.insert(record_image_relative_path(&record_id, &hash, &extension)?);
+    }
+    Ok(paths)
+}
+
 pub fn image_manifest(connection: &Connection) -> Result<HashMap<String, BlobMetadata>, String> {
     let mut statement = connection
         .prepare(
@@ -2305,12 +2553,31 @@ mod tests {
     }
 
     #[test]
+    fn history_query_accepts_null_optional_filters() {
+        let query: HistoryQuery = serde_json::from_value(json!({
+            "keyword": null,
+            "date": null,
+            "status": null,
+            "folderKind": null,
+            "folderKey": null
+        }))
+        .unwrap();
+        assert!(query.keyword.is_empty());
+        assert!(query.date.is_empty());
+        assert!(query.status.is_empty());
+        assert!(query.folder_kind.is_empty());
+        assert!(query.folder_key.is_empty());
+        assert_eq!(query.page, 1);
+        assert_eq!(query.page_size, 20);
+    }
+
+    #[test]
     fn image_pool_deduplicates_by_hash() {
         let root = temporary_root("images");
         fs::create_dir_all(&root).unwrap();
         let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
-        let first = store_image_bytes(&root, &bytes, 10, 20).unwrap();
-        let second = store_image_bytes(&root, &bytes, 10, 20).unwrap();
+        let first = store_image_bytes(&root, "record-images", &bytes, 10, 20).unwrap();
+        let second = store_image_bytes(&root, "record-images", &bytes, 10, 20).unwrap();
         assert_eq!(first.hash, second.hash);
         assert_eq!(first.relative_path, second.relative_path);
         assert!(root
@@ -2368,10 +2635,83 @@ mod tests {
     #[test]
     fn blob_path_must_match_content_addressed_layout() {
         let hash = "ab".repeat(32);
-        let expected = format!("images/ab/{hash}.png");
-        assert!(validate_blob_relative_path(&hash, "png", &expected).is_ok());
+        let legacy = format!("images/ab/{hash}.png");
+        let record_path = format!("images/record-path/{hash}.png");
+        assert!(validate_blob_relative_path(&hash, "png", &legacy).is_ok());
+        assert!(validate_blob_relative_path(&hash, "png", &record_path).is_ok());
         assert!(validate_blob_relative_path(&hash, "png", "images/../../outside.png").is_err());
-        assert!(validate_blob_relative_path(&hash, "exe", &expected).is_err());
+        assert!(validate_blob_relative_path(&hash, "exe", &legacy).is_err());
+    }
+
+    #[test]
+    fn bootstrap_organizes_legacy_image_into_record_directory() {
+        let root = temporary_root("organize-legacy-image");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 8, 6, 4];
+        let hash = hex::encode(Sha256::digest(bytes));
+        let legacy_relative_path = format!("images/{}/{}.png", &hash[..2], hash);
+        let legacy_path =
+            root.join(legacy_relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, bytes).unwrap();
+
+        let mut connection = open_database(&root, true).unwrap();
+        initialize_schema(&connection).unwrap();
+        insert_blob(
+            &connection,
+            &BlobMetadata {
+                hash: hash.clone(),
+                relative_path: legacy_relative_path,
+                extension: "png".to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: bytes.len() as u64,
+                width: 10,
+                height: 20,
+            },
+        )
+        .unwrap();
+        let transaction = connection.transaction().unwrap();
+        save_draft_tx(
+            &transaction,
+            &json!({
+                "id": "record-organized",
+                "updatedAt": now_iso8601(),
+                "expenses": [{
+                    "id": "expense-organized",
+                    "fileName": "legacy.png",
+                    "blobHash": hash,
+                    "naturalWidth": 10,
+                    "naturalHeight": 20,
+                    "extraAttachments": []
+                }]
+            }),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let result = bootstrap_at_root(&root, None, false);
+        assert_eq!(result.status, "ready", "{}", result.message);
+        assert!(
+            !result.message.contains("整理图片失败"),
+            "{}",
+            result.message
+        );
+        let expected_relative_path = format!("images/record-organized/{hash}.png");
+        let expected_path =
+            root.join(expected_relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        assert_eq!(fs::read(&expected_path).unwrap(), bytes);
+        let connection = open_database(&root, false).unwrap();
+        let stored_path: String = connection
+            .query_row(
+                "SELECT relative_path FROM image_blobs WHERE hash=?1",
+                [&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_path, expected_relative_path);
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2392,10 +2732,10 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
         let hash = hex::encode(Sha256::digest(bytes));
-        let path = root.join(format!("images/{}/{}.png", &hash[..2], hash));
+        let path = root.join(format!("images/record-corrupt/{hash}.png"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"corrupt").unwrap();
-        assert!(store_image_bytes(&root, &bytes, 10, 20).is_err());
+        assert!(store_image_bytes(&root, "record-corrupt", &bytes, 10, 20).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

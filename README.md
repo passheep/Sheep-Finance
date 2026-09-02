@@ -46,7 +46,7 @@ NSIS 安装包默认生成在 `app/src-tauri/target/release/bundle/nsis/`。
 
 ## 数据与安全
 
-数据默认保存在 `%APPDATA%\com.sheepfinance.app`：`sheepfinance.db` 保存单据、费用、设置与请求记录，`images/` 保存原始图片，`backups/database/` 保存数据库快照。0.2.0 首次启动会自动迁移旧版 JSON，成功后将旧文件归档为 `legacy-json-<时间>`，至少存在一份有效数据库备份后才允许手工清理。
+数据默认保存在 `%APPDATA%\com.sheepfinance.app`：`sheepfinance.db` 保存单据、费用、设置与请求记录，`images/<报销单编号>/` 按单据归集原始图片，`backups/database/` 保存数据库快照。0.2.x 首次启动会自动迁移旧版 JSON，成功后将旧文件归档为 `legacy-json-<时间>`，至少存在一份有效数据库备份后才允许手工清理。
 
 自动备份只包含数据库并继续引用本机不可变图片池；跨电脑迁移或防范整块磁盘故障时，应在设置中导出“完整备份” ZIP，其中包含一致性数据库快照、全部引用图片和哈希清单。数据库、完整 ZIP 和配置 TXT 都包含 OCR/大模型密钥，应按敏感资料保管。请勿将 API Key、真实报销数据或本地导出的备份提交到 Git。
 

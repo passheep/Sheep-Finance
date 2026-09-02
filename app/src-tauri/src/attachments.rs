@@ -9,6 +9,7 @@ use crate::database;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreAttachmentRequest {
+    pub record_id: String,
     pub data_url: String,
     pub recognition_data_url: Option<String>,
     #[serde(default)]
@@ -50,6 +51,7 @@ pub async fn store_attachment(
         let (bytes, _) = database::decode_image_data_url(&request.data_url)?;
         let original = database::store_image_bytes(
             &root,
+            &request.record_id,
             &bytes,
             request.natural_width,
             request.natural_height,
@@ -65,6 +67,7 @@ pub async fn store_attachment(
                     let (bytes, _) = database::decode_image_data_url(value)?;
                     let blob = database::store_image_bytes(
                         &root,
+                        &request.record_id,
                         &bytes,
                         request.natural_width,
                         request.natural_height,
@@ -128,12 +131,20 @@ pub async fn save_attachment_as(
 }
 
 #[tauri::command]
-pub async fn open_attachment_folder(app: AppHandle, blob_hash: String) -> Result<(), String> {
+pub async fn open_attachment_folder(
+    app: AppHandle,
+    blob_hash: String,
+    record_id: Option<String>,
+) -> Result<(), String> {
     let root = database::storage_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = database::storage_guard()?;
         let connection = database::open_database(&root, false)?;
-        let path = database::image_path_for_hash(&connection, &root, &blob_hash)?;
+        let path = if let Some(record_id) = record_id.as_deref() {
+            database::record_image_path_for_hash(&connection, &root, record_id, &blob_hash)?
+        } else {
+            database::image_path_for_hash(&connection, &root, &blob_hash)?
+        };
         if !path.exists() {
             return Err("图片文件已丢失".to_string());
         }
