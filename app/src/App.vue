@@ -7204,7 +7204,7 @@ onUnmounted(() => {
         <h1>SheepFinance</h1>
         <p>将票据截图识别、核对并排版为报销单的本地桌面工具。</p>
         <div class="about-meta">
-          <span>版本 0.2.1</span><span>Windows 10 x64</span>
+          <span>版本 0.2.2</span><span>Windows 10 x64</span>
         </div>
         <div class="about-links">
           <el-link

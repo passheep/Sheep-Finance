@@ -23,6 +23,9 @@ pub const FULL_BACKUP_DIRECTORY: &str = "backups/full";
 pub const MAX_DATABASE_BACKUPS: usize = 5;
 pub const BACKUP_INTERVAL_SECONDS: i64 = 72 * 60 * 60;
 
+const MIN_DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 3;
+
 static STORAGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 const SCHEMA: &str = r#"
@@ -36,9 +39,11 @@ CREATE TABLE IF NOT EXISTS records (
     first_occurred_date TEXT NOT NULL DEFAULT '',
     expense_count INTEGER NOT NULL DEFAULT 0,
     total_cents INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
     data_json TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_records_created_at ON records(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_records_updated_at ON records(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_records_company ON records(company_name);
 CREATE INDEX IF NOT EXISTS idx_records_status ON records(status);
@@ -136,7 +141,7 @@ CREATE TABLE IF NOT EXISTS app_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 "#;
 
 #[derive(Clone, Debug, Serialize)]
@@ -328,6 +333,114 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
         .map_err(|error| format!("初始化数据库结构失败：{error}"))
 }
 
+fn records_have_created_at(connection: &Connection) -> Result<bool, String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(records)")
+        .map_err(|error| format!("读取单据表结构失败：{error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("查询单据表结构失败：{error}"))?;
+    for column in columns {
+        if column.map_err(|error| error.to_string())? == "created_at" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn upgrade_database_schema(connection: &Connection) -> Result<(), String> {
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| format!("读取数据库版本失败：{error}"))?;
+    if user_version < MIN_DATABASE_SCHEMA_VERSION {
+        return Err("数据库版本过旧，无法自动升级".to_string());
+    }
+
+    let has_created_at = records_have_created_at(connection)?;
+    if user_version >= DATABASE_SCHEMA_VERSION && has_created_at {
+        return Ok(());
+    }
+
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("开启数据库升级事务失败：{error}"))?;
+    if !has_created_at {
+        transaction
+            .execute(
+                "ALTER TABLE records ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| format!("新增单据创建时间字段失败：{error}"))?;
+    }
+
+    let records = {
+        let mut statement = transaction
+            .prepare("SELECT id, updated_at FROM records WHERE created_at='' OR created_at IS NULL")
+            .map_err(|error| format!("准备创建时间迁移失败：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("查询待迁移单据失败：{error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取待迁移单据失败：{error}"))?
+    };
+    for (record_id, updated_at) in records {
+        transaction
+            .execute(
+                "UPDATE records SET created_at=?1 WHERE id=?2",
+                params![infer_record_created_at(&record_id, &updated_at), record_id],
+            )
+            .map_err(|error| format!("回填单据创建时间失败：{error}"))?;
+    }
+    transaction
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_records_created_at ON records(created_at DESC, id DESC)",
+            [],
+        )
+        .map_err(|error| format!("创建单据时间索引失败：{error}"))?;
+    transaction
+        .pragma_update(
+            None,
+            "user_version",
+            user_version.max(DATABASE_SCHEMA_VERSION),
+        )
+        .map_err(|error| format!("更新数据库版本失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交数据库升级失败：{error}"))
+}
+
+fn infer_record_created_at(record_id: &str, updated_at: &str) -> String {
+    created_at_from_record_id(record_id)
+        .or_else(|| normalize_record_timestamp(updated_at))
+        .unwrap_or_else(|| updated_at.to_string())
+}
+
+fn created_at_from_record_id(record_id: &str) -> Option<String> {
+    let timestamp = record_id.strip_prefix("record-")?.split_once('-')?.0;
+    if timestamp.is_empty() || !timestamp.bytes().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    let milliseconds = timestamp.parse::<i128>().ok()?;
+    let datetime =
+        OffsetDateTime::from_unix_timestamp_nanos(milliseconds.checked_mul(1_000_000)?).ok()?;
+    datetime
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .ok()
+}
+
+fn normalize_record_timestamp(value: &str) -> Option<String> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()?
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .ok()
+}
+
 pub fn quick_check(connection: &Connection) -> Result<(), String> {
     let result: String = connection
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
@@ -353,8 +466,11 @@ pub fn validate_database_file(path: &Path) -> Result<(), String> {
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| format!("数据库版本检查失败：{error}"))?;
-    if schema_tables != 5 || user_version < 2 {
+    if schema_tables != 5 || user_version < MIN_DATABASE_SCHEMA_VERSION {
         return Err("数据库结构不完整或版本不受支持".to_string());
+    }
+    if user_version >= DATABASE_SCHEMA_VERSION && !records_have_created_at(&connection)? {
+        return Err("数据库缺少单据创建时间字段".to_string());
     }
     let foreign_key_error: Option<i64> = connection
         .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
@@ -396,10 +512,16 @@ pub fn bootstrap_at_root(
         }
     }
     if database.exists() {
-        return match validate_database_file(&database).and_then(|_| {
-            let connection = open_database_readonly_at(&database)?;
-            validate_referenced_images(root, &connection, true)
-        }) {
+        return match open_database(root, false)
+            .and_then(|connection| {
+                quick_check(&connection)?;
+                upgrade_database_schema(&connection)
+            })
+            .and_then(|_| validate_database_file(&database))
+            .and_then(|_| {
+                let connection = open_database_readonly_at(&database)?;
+                validate_referenced_images(root, &connection, true)
+            }) {
             Ok(()) => {
                 let image_organization_warning = organize_images_by_record_at_root(root).err();
                 let migrated_legacy_remains = open_database_readonly_at(&database)
@@ -434,7 +556,7 @@ pub fn bootstrap_at_root(
             Err(error) => bootstrap_failure(
                 root,
                 "recoveryRequired",
-                format!("主数据库损坏或无法读取：{error}"),
+                format!("主数据库损坏、无法读取或无法升级：{error}"),
                 vec![database.to_string_lossy().into_owned()],
                 false,
             ),
@@ -1470,6 +1592,7 @@ fn save_draft_tx(transaction: &Transaction<'_>, raw_draft: &Value) -> Result<boo
     } else {
         updated_at
     };
+    let created_at = infer_record_created_at(id, &updated_at);
     let existing_updated_at: Option<String> = transaction
         .query_row("SELECT updated_at FROM records WHERE id=?1", [id], |row| {
             row.get(0)
@@ -1493,8 +1616,8 @@ fn save_draft_tx(transaction: &Transaction<'_>, raw_draft: &Value) -> Result<boo
         .execute(
             "INSERT INTO records
              (id, label, status, company_name, applicant, reimbursement_date,
-              first_occurred_date, expense_count, total_cents, updated_at, data_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+              first_occurred_date, expense_count, total_cents, created_at, updated_at, data_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
               label=excluded.label, status=excluded.status, company_name=excluded.company_name,
               applicant=excluded.applicant, reimbursement_date=excluded.reimbursement_date,
@@ -1511,6 +1634,7 @@ fn save_draft_tx(transaction: &Transaction<'_>, raw_draft: &Value) -> Result<boo
                 first_occurred_date,
                 expenses.len() as i64,
                 total,
+                created_at,
                 updated_at,
                 draft_json,
             ],
@@ -2179,7 +2303,7 @@ fn query_history_records(
     let sql = format!(
         "SELECT id, label, status, company_name, applicant, reimbursement_date,
          expense_count, total_cents, first_occurred_date, updated_at
-         FROM records{where_sql} ORDER BY updated_at DESC LIMIT {page_size} OFFSET {offset}"
+         FROM records{where_sql} ORDER BY created_at DESC, id DESC LIMIT {page_size} OFFSET {offset}"
     );
     let mut statement = connection
         .prepare(&sql)
@@ -2547,6 +2671,13 @@ mod tests {
                 .unwrap(),
             2
         );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
+        assert!(records_have_created_at(&connection).unwrap());
         quick_check(&connection).unwrap();
         drop(connection);
         fs::remove_dir_all(root).unwrap();
@@ -2569,6 +2700,134 @@ mod tests {
         assert!(query.folder_key.is_empty());
         assert_eq!(query.page, 1);
         assert_eq!(query.page_size, 20);
+    }
+
+    #[test]
+    fn database_upgrade_backfills_record_creation_time() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE records (
+                    id TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL
+                 );
+                 INSERT INTO records(id, updated_at, data_json)
+                 VALUES
+                    ('record-0-from-id', '2026-09-02T10:00:00.000Z', '{}'),
+                    ('legacy-record', '2026-09-02T11:22:33.000Z', '{}');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+
+        upgrade_database_schema(&connection).unwrap();
+
+        let from_id: String = connection
+            .query_row(
+                "SELECT created_at FROM records WHERE id='record-0-from-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fallback: String = connection
+            .query_row(
+                "SELECT created_at FROM records WHERE id='legacy-record'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(from_id, "1970-01-01T00:00:00.000Z");
+        assert_eq!(fallback, "2026-09-02T11:22:33.000Z");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn history_order_stays_by_creation_time_after_edit_and_status_change() {
+        let root = temporary_root("history-created-order");
+        fs::create_dir_all(&root).unwrap();
+        let mut connection = open_database(&root, true).unwrap();
+        initialize_schema(&connection).unwrap();
+        let save_record =
+            |connection: &mut Connection, record_id: &str, label: &str, updated_at: &str| {
+                let transaction = connection.transaction().unwrap();
+                save_draft_tx(
+                    &transaction,
+                    &json!({
+                        "id": record_id,
+                        "label": label,
+                        "status": "未报销",
+                        "updatedAt": updated_at,
+                        "expenses": []
+                    }),
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+            };
+        let older_id = "record-1767225600000-older";
+        let newer_id = "record-1767312000000-newer";
+        save_record(
+            &mut connection,
+            older_id,
+            "较早创建",
+            "2026-01-01T00:00:00.000Z",
+        );
+        save_record(
+            &mut connection,
+            newer_id,
+            "较晚创建",
+            "2026-01-02T00:00:00.000Z",
+        );
+
+        save_record(
+            &mut connection,
+            older_id,
+            "较早创建但刚编辑",
+            "2026-09-03T08:00:00.000Z",
+        );
+        let history_query = HistoryQuery {
+            page: 1,
+            page_size: 20,
+            ..HistoryQuery::default()
+        };
+        let records = query_history_records(&connection, &history_query)
+            .unwrap()
+            .0;
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![newer_id, older_id]
+        );
+        let older_created_at: String = connection
+            .query_row(
+                "SELECT created_at FROM records WHERE id=?1",
+                [older_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(older_created_at, "2026-01-01T00:00:00.000Z");
+        drop(connection);
+
+        update_record_status_at_root(&root, older_id, "已报销").unwrap();
+        let connection = open_database(&root, false).unwrap();
+        let records = query_history_records(&connection, &history_query)
+            .unwrap()
+            .0;
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![newer_id, older_id]
+        );
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
