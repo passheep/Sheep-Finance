@@ -10,6 +10,7 @@ mod storage_sql;
 pub fn run() {
     tauri::Builder::default()
         .manage(lan_upload::LanUploadManager::default())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())

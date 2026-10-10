@@ -36,3 +36,4 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["net", "rt", "sync"] }
 rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 zip = { version = "2", default-features = false, features = ["deflate", "time"] }
+tauri-plugin-window-state = "2.5.0"

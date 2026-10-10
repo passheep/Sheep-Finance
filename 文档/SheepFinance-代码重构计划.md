@@ -536,9 +536,20 @@ SHEEPFINANCE_REFACTOR_MODE=baseline node --test src/__tests__/refactor.browser.t
 
 ### 13. 软件改名【报销单助手】与 0.3.0（2026-10-10）
 
+> 本节为首次 0.3.0 改名记录；同日顶栏布局与窗口状态修正见第 14 节。
+
 本轮授权变更：对外显示名从 SheepFinance 统一改为【报销单助手】，去掉顶栏品牌文字和图标，主标签区从左上角开始；窗口/任务栏标题、网页标题、关于页（真实应用图标 + 报销单助手 + 版本 0.3.0）、手机上传页、Excel creator、完整备份/配置导出默认文件名同步改名；版本升级 0.3.0（npm/lock/Cargo/tauri.conf）。
 
 兼容性保留：数据标识 `com.sheepfinance.app`、localStorage 键、配置加密 secret `SheepFinance::local-configuration-transfer::v1`、Rust 备份文件名前缀 `SheepFinance-`（旧备份恢复/轮换依赖）及内部函数/类型命名均未改。导出文件名前缀改为【报销单助手-】是新增默认名，不影响已有文件。
 
 验证：四文件 32/32、`vue-tsc --noEmit` 通过；旧 0.2.2 NSIS 包已另存保全（SHA 一致）。0.3.0 构建通过（code 0）：`app.exe` 23,430,656 bytes，SHA-256 `ca6398ca4ec64aed474e260dd0dfdaf2e484aab08b6e032c12e2aae758ebd155`；NSIS `C:/000Program/Sheep‌Finance/app/src-tauri/target/release/bundle/nsis/报销单助手_0.3.0_x64-setup.exe` 9,340,531 bytes，SHA-256 `01835f3931dadd78425bc6875cc5dfbc7f2d77ce61c0f8f6a9865b9bffc5232e`；PE/ICO 核验两个产物均嵌入源图生成的六尺寸图标。同样未安装、启动或卸载。
+
+### 14. 顶栏布局修正与窗口状态记忆（2026-10-10）
+
+用户实测 0.3.0 反馈两处问题并均已修正：
+
+1. **顶栏布局**：品牌块移除后 `workbench.css`/`pages.css` 三处顶栏网格仍为三列（品牌/导航/操作），两个子元素落入前两列导致标签被截断、操作区左移并与保存状态重叠。修正为两列 `auto minmax(320px, 1fr)`，第三处旧版覆盖同步改为两列并给 `.topbar-actions` 补 `justify-self: end`。views CSS 对照新增三处授权替换；同时把模板与 CSS 读取统一规范化行尾——合并 main 后 git 按 autocrlf 检出为 CRLF，LF 精确对照会误报，属测试对检出环境的适配而非放宽断言。
+2. **窗口状态记忆**：新增 `tauri-plugin-window-state 2.5.0`（官方插件，Rust 侧自动保存/恢复窗口大小、位置和最大化状态，状态文件位于应用数据目录）。接线仅 `Cargo.toml`、`lib.rs` 注册和 capability `window-state:default` 三处；无前端 invoke、无新增 npm 包。代价是 Cargo.lock 随插件引入 wry/tao 等 windows 依赖更新，27 commands、3 events、SQL 和备份格式不变。
+
+验证：`cargo check` 通过；views 4/4、四文件合并 32/32、`vue-tsc --noEmit` 通过；浏览器 features 4/4、**189 项断言**（新增 12 项顶栏布局断言：三视口下标签完整显示、靠左、操作区靠右、不重叠），`runtimeErrors/blockedRequests/cleanupErrors` 均为空，产物 `C:/Users/yzy90/AppData/Local/Temp/SheepFinance-refactor/features-Uv3ezq/`。首次 0.3.0 包（9,340,531 bytes，SHA `01835f39…`）已另存保全。修复后重建 code 0：`app.exe` 24,600,064 bytes，SHA-256 `af631d3082eb1063c57cd29714a6b34806d2cec6ff4f70d1c4258f297673409a`；NSIS `报销单助手_0.3.0_x64-setup.exe` 10,074,417 bytes，SHA-256 `354783b8d9d5cfa04fcde08208cdc655329f0228b061caf93f14a28489dac2b5`（PE/ICO 核验两个产物均嵌入六尺寸图标）。重建时 cargo add 升级了 Rust tauri 至 2.12.2，同步升级 npm `@tauri-apps/api` 至 2.12.2 对齐版本。窗口恢复行为需实机安装验证，本轮未安装。
 

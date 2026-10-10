@@ -736,6 +736,25 @@ async function runFeatureChecks({ browser, sessionId, signal, artifacts, diagnos
     expect(`${width}：桌面视口宽度`, icons.viewportWidth, width);
     assert.ok(icons.faviconWidth > 0 && icons.faviconHeight > 0,
       `${width}：图标实际解码尺寸必须大于零`);
+    // 顶栏为两列网格：导航靠左完整显示，操作区靠右，二者不重叠。
+    const topbarLayout = await evaluate(`(() => {
+      const tabs = document.querySelector('nav.main-tabs');
+      const actions = document.querySelector('.topbar-actions');
+      if (!(tabs instanceof HTMLElement) || !(actions instanceof HTMLElement)) throw new Error('顶栏结构缺失');
+      const tabsRect = tabs.getBoundingClientRect();
+      const actionsRect = actions.getBoundingClientRect();
+      const tabRects = [...tabs.querySelectorAll('.main-tab')].map(tab => tab.getBoundingClientRect());
+      return {
+        tabsLeft: tabsRect.left,
+        actionsRight: actionsRect.right,
+        overlap: tabRects.some(rect => rect.right > actionsRect.left + 1),
+        tabsFullyVisible: tabRects.every(rect => rect.width >= 40 && rect.height >= 20 && rect.right <= innerWidth && rect.left >= 0),
+      };
+    })()`);
+    expect(`${width}：主标签完整显示`, topbarLayout.tabsFullyVisible, true);
+    expect(`${width}：主标签区靠左`, topbarLayout.tabsLeft <= 40, true);
+    expect(`${width}：操作区靠右`, topbarLayout.actionsRight >= width - 40, true);
+    expect(`${width}：标签与操作区不重叠`, topbarLayout.overlap, false);
     assertApproval(`${width}工作区审批`, await evaluate("window.__refactorApproval(document)"), "秘书处", false, false);
     const capture = async () => (await browser.command("Page.captureScreenshot", {
       format: "png", fromSurface: true, captureBeyondViewport: false,

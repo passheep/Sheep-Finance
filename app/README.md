@@ -52,6 +52,7 @@ src/
 - 保存保留 `900ms` 防抖、revision 比较以及 loading、`storageReady`、suppress 门禁。桌面历史按 `createdAt + ID` 稳定倒序，日期筛选看第一笔费用日期，不看报销日期或更新时间。
 - 浏览器 `localStorage` 仅持久化历史列表前 20 项，是演示回退，不等同于桌面存储。局域网上传默认 15 分钟，需同步目标容量并在切单后失效。
 - SQLite v3/11 表、存储键、27 个 Tauri commands、3 个 events、图片引用和备份格式保持兼容。Rust 原有 `database`、`storage_sql`、`attachments`、`recognition`、`lan_upload`、`request_log`、`backup` 已分域，本轮必要性评估不要求修改或重构 Rust。
+- 窗口大小、位置和最大化状态由 Rust 侧 `tauri-plugin-window-state` 自动保存/恢复，状态文件位于应用数据目录；不新增前端命令，不影响 27 commands、3 events、SQL 或备份格式。
 
 数据默认位于 `%APPDATA%\com.sheepfinance.app`，以 runtime 实际返回目录为准。JSON/DB/ZIP 中现有凭据没有 DPAPI 保护；配置 TXT 使用固定内置 secret 的 AES-256-GCM/PBKDF2-SHA256（180000 次、version 1），不是用户密码保护。详细字段和恢复规则见[开发设计文档](../文档/SheepFinance-开发设计文档.md)。
 
@@ -87,7 +88,7 @@ compare 使用上一条实际输出的基线文件；可用 `SHEEPFINANCE_TEST_B
 node --input-type=module -e 'import {build} from "vite"; await build({build:{emptyOutDir:false}})'
 ```
 
-`vite.config.ts` 已设置 `build.emptyOutDir: false`，因此 `npm run build` 及 Tauri 的 `beforeBuildCommand` 也保留旧的哈希资源。NSIS 打包使用已授权的 `npm run tauri build`，不是每阶段必跑门禁；重建同名安装包前须另存旧包并核对哈希。旧 0.2.2 最终包（SheepFinance_0.2.2_x64-setup.exe，8,564,950 bytes，SHA-256 763b8eae322825baa897c30e29d6a8f2b17e88ad53a1fa21948811bb4c87f725）已另存保全。当前 0.3.0 最终包：`src-tauri/target/release/bundle/nsis/报销单助手_0.3.0_x64-setup.exe`，9,340,531 bytes，SHA-256 `01835f3931dadd78425bc6875cc5dfbc7f2d77ce61c0f8f6a9865b9bffc5232e`，未安装或启动。图标源为 `../文档/报销申请.png`，使用现有 Tauri CLI 生成 `src-tauri/icons/`；软件内和 favicon 读取 `public/app-icon.png`，NSIS 安装/卸载显式引用 `icons/icon.ico`。
+`vite.config.ts` 已设置 `build.emptyOutDir: false`，因此 `npm run build` 及 Tauri 的 `beforeBuildCommand` 也保留旧的哈希资源。NSIS 打包使用已授权的 `npm run tauri build`，不是每阶段必跑门禁；重建同名安装包前须另存旧包并核对哈希。旧 0.2.2 包和首次 0.3.0 包均已另存保全。当前 0.3.0 修复后最终包：`src-tauri/target/release/bundle/nsis/报销单助手_0.3.0_x64-setup.exe`，10,074,417 bytes，SHA-256 `354783b8d9d5cfa04fcde08208cdc655329f0228b061caf93f14a28489dac2b5`（含顶栏布局修复与窗口状态记忆），未安装或启动。图标源为 `../文档/报销申请.png`，使用现有 Tauri CLI 生成 `src-tauri/icons/`；软件内和 favicon 读取 `public/app-icon.png`，NSIS 安装/卸载显式引用 `icons/icon.ico`。
 
 ## 验证安全与未完成项
 

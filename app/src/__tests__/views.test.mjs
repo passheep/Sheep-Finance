@@ -34,6 +34,8 @@ function normalizeExpression(source) {
 }
 
 function readView(file, source = fs.readFileSync(file, "utf8")) {
+  // git 按 autocrlf 检出时工作区可能是 CRLF，统一规范化后与 LF 基线可比。
+  source = source.replace(/\r\n/g, "\n");
   const { descriptor, errors } = parse(source, { filename: file });
   assert.deepEqual(errors, [], `组件解析失败：${file}`);
   const ast = baseParse(descriptor.template.content);
@@ -263,11 +265,11 @@ test("拆分组件展开后保留旧版 DOM、分页定位属性和全部事件�
 });
 
 test("全局样式按原次序拼接，包含原有打印和响应式规则", () => {
-  const previous = parse(baseline).descriptor.styles[0].content;
+  const previous = parse(baseline).descriptor.styles[0].content.replace(/\r\n/g, "\n");
   const imports = fs.readFileSync(path.join(root, "src/styles/app.css"), "utf8");
   const cssFiles = [...imports.matchAll(/@import "\.\/([^"]+)";/g)].map(match => match[1]);
   assert.deepEqual(cssFiles, ["base.css", "workbench.css", "pages.css", "print.css"]);
-  const current = cssFiles.map(file => fs.readFileSync(path.join(root, "src/styles", file), "utf8")).join("");
+  const current = cssFiles.map(file => fs.readFileSync(path.join(root, "src/styles", file), "utf8").replace(/\r\n/g, "\n")).join("");
   const approvalRules = `.approval-field {
   min-width: 0;
 }
@@ -305,9 +307,44 @@ test("全局样式按原次序拼接，包含原有打印和响应式规则", ()
   const previousAboutImageRules = `  font-size: 62px;
   font-weight: 800;
 `;
+  // 本轮把三处顶栏网格从三列（品牌/导航/操作）改为两列，品牌块移除后导航靠左、操作靠右。
+  const currentTopbarGrid = `.topbar {
+  display: grid;
+  grid-template-columns: auto minmax(320px, 1fr);
+  position: relative;
+}`;
+  const previousTopbarGrid = `.topbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto minmax(320px, 1fr);
+  position: relative;
+}`;
+  const currentMediaTopbarGrid = `    grid-template-columns: auto minmax(300px, 1fr);`;
+  const previousMediaTopbarGrid = `    grid-template-columns: 220px auto minmax(300px, 1fr);`;
+  const currentLegacyTopbarGrid = `.topbar {
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 14px;
+  padding-right: 18px;
+  padding-left: 18px;
+}
+.topbar-actions {
+  min-width: 0;
+  justify-self: end;
+}`;
+  const previousLegacyTopbarGrid = `.topbar {
+  grid-template-columns: 190px auto minmax(0, 1fr);
+  gap: 14px;
+  padding-right: 18px;
+  padding-left: 18px;
+}
+.topbar-actions {
+  min-width: 0;
+}`;
   let comparable = replaceExactlyOnce(current, approvalRules, "", "审批下拉和导出局部样式");
   comparable = replaceExactlyOnce(comparable, printApprovalRules, "", "打印审批局部样式");
   comparable = replaceExactlyOnce(comparable, currentAboutImageRules, previousAboutImageRules, "关于页图标样式");
+  comparable = replaceExactlyOnce(comparable, currentTopbarGrid, previousTopbarGrid, "顶栏网格主规则");
+  comparable = replaceExactlyOnce(comparable, currentMediaTopbarGrid, previousMediaTopbarGrid, "窄屏顶栏网格");
+  comparable = replaceExactlyOnce(comparable, currentLegacyTopbarGrid, previousLegacyTopbarGrid, "旧版顶栏网格");
 
   const previousBrandContainer = `.brand-block,
 .topbar-actions,

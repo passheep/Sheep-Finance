@@ -186,7 +186,7 @@
 }
 @media (max-width: 1220px) {
   .topbar {
-    grid-template-columns: 220px auto minmax(300px, 1fr);
+    grid-template-columns: auto minmax(300px, 1fr);
     padding-left: 18px;
     padding-right: 18px;
   }
@@ -628,13 +628,14 @@
   gap: 5px;
 }
 .topbar {
-  grid-template-columns: 190px auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr);
   gap: 14px;
   padding-right: 18px;
   padding-left: 18px;
 }
 .topbar-actions {
   min-width: 0;
+  justify-self: end;
 }
 .save-state {
   min-width: 112px;
