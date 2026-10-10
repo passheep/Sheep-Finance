@@ -1,0 +1,104 @@
+
+:root {
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  color: #25313a;
+  background: #eef1ef;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-width: 1180px;
+  background: #eef1ef;
+}
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+}
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #eef1ef;
+}
+.topbar {
+  height: 70px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 0 28px;
+  background: #fbfcfa;
+  border-bottom: 1px solid #dce4df;
+}
+.topbar-actions,
+.preview-tools,
+.inspector-actions {
+  display: flex;
+  align-items: center;
+}
+.topbar-actions {
+  gap: 8px;
+}
+.topbar-actions .el-button {
+  gap: 5px;
+}
+.save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-right: 7px;
+  color: #698078;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.save-state.dirty {
+  color: #b45d47;
+}
+.workspace {
+  min-height: 0;
+  flex: 1;
+  display: grid;
+  grid-template-columns: var(--left-panel-width, 404px) 8px minmax(0, 1fr);
+}
+.workspace-resizer {
+  position: relative;
+  z-index: 5;
+  cursor: col-resize;
+  touch-action: none;
+  background: #e1e8e3;
+}
+.workspace-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.workspace-resizer:hover::after,
+.workspace-resizer:active::after {
+  background: #cf674d;
+}
+.left-panel {
+  min-height: calc(100vh - 70px);
+  padding: 22px 18px 30px 24px;
+  overflow: auto;
+  border-right: 1px solid #dce4df;
+  background: #f5f7f5;
+}
+.preview-panel {
+  min-width: 0;
+  min-height: calc(100vh - 70px);
+  display: flex;
+  flex-direction: column;
+  background: #e4e9e5;
+}

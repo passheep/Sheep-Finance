@@ -1,0 +1,47 @@
+@media print {
+  .approval-select {
+    display: none !important;
+  }
+  .approval-export-text {
+    display: inline !important;
+  }
+  .reimbursement-active .paper-scale,
+  .reimbursement-active .paper-scale.double-page-scale {
+    width: 794px !important;
+    height: auto !important;
+  }
+  .preview-pages {
+    gap: 0;
+    transform: none !important;
+  }
+  .paper {
+    break-after: page;
+    page-break-after: always;
+    box-shadow: none !important;
+  }
+  .paper:last-child {
+    break-after: auto;
+    page-break-after: auto;
+  }
+  .attachment-object,
+  .attachment-object.selected,
+  .attachment-object:hover {
+    border-color: transparent !important;
+    box-shadow: none !important;
+  }
+  .attachment-label,
+  .resize-handle,
+  .paper-row-drag-handle {
+    display: none !important;
+  }
+  .paper-table tr.selected-row td {
+    background: #fff !important;
+  }
+  .paper-table td.paper-cell-selected {
+    background: #fff !important;
+    box-shadow: none !important;
+  }
+  .paper-empty-hint {
+    display: none !important;
+  }
+}

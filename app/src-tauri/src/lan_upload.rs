@@ -546,13 +546,13 @@ fn mobile_page(session: &UploadSession) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-  <title>SheepFinance 手机上传</title>
+  <title>报销单助手 手机上传</title>
   <style>
     *{{box-sizing:border-box}}body{{margin:0;color:#26352f;background:#eef1ef;font-family:"Microsoft YaHei","PingFang SC",sans-serif}}button,input{{font:inherit}}header{{padding:22px 20px 18px;color:#fff;background:#4e7164}}header small{{display:block;margin-bottom:5px;opacity:.75}}header h1{{margin:0;font-size:22px;letter-spacing:0}}header p{{margin:7px 0 0;opacity:.84;font-size:12px}}main{{max-width:620px;margin:0 auto;padding:18px 16px 34px}}.summary{{display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid #d9e1dc;color:#6b7b74;font-size:12px}}.picker{{display:grid;place-items:center;min-height:128px;margin-top:18px;border:1px dashed #9db2a7;border-radius:8px;color:#48675b;background:#fff;cursor:pointer}}.picker strong{{display:block;margin-bottom:5px;font-size:16px}}.picker span{{font-size:12px;color:#87958f}}#files{{display:none}}.previews{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:14px}}.preview{{position:relative;aspect-ratio:1;overflow:hidden;border-radius:6px;background:#dfe6e2}}.preview img{{width:100%;height:100%;display:block;object-fit:cover}}.preview span{{position:absolute;right:4px;bottom:4px;max-width:calc(100% - 8px);overflow:hidden;padding:2px 5px;color:#fff;background:rgba(28,40,35,.72);font-size:10px;text-overflow:ellipsis;white-space:nowrap}}.action{{width:100%;height:46px;margin-top:16px;border:0;border-radius:8px;color:#fff;background:#c85f47;font-weight:700;cursor:pointer}}.action:disabled{{cursor:not-allowed;opacity:.45}}.status{{min-height:42px;margin-top:12px;padding:10px 12px;border-radius:7px;color:#61726a;background:#f8faf8;font-size:12px;line-height:1.7}}.status.success{{color:#27725c;background:#edf8f3}}.status.error{{color:#a5433c;background:#fff2ef}}footer{{padding-top:22px;color:#95a19b;text-align:center;font-size:11px}}@media(max-width:390px){{.previews{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
   </style>
 </head>
 <body>
-  <header><small>SHEEPFINANCE</small><h1>{title}</h1><p>报销单 #{record_suffix}</p></header>
+  <header><small>报销单助手</small><h1>{title}</h1><p>报销单 #{record_suffix}</p></header>
   <main>
     <div class="summary"><span>可上传 <b id="remaining">{remaining}</b> 张</span><span id="expires"></span></div>
     <label class="picker" for="files"><div><strong>选择票据图片</strong><span>支持从相册多选</span></div></label>
@@ -560,7 +560,7 @@ fn mobile_page(session: &UploadSession) -> String {
     <div id="previews" class="previews"></div>
     <button id="upload" class="action" type="button" disabled>上传到电脑</button>
     <div id="status" class="status">等待选择图片</div>
-    <footer>SheepFinance 局域网上传</footer>
+    <footer>报销单助手 局域网上传</footer>
   </main>
   <script>
     const input=document.querySelector('#files');const previews=document.querySelector('#previews');const upload=document.querySelector('#upload');const status=document.querySelector('#status');const remaining=document.querySelector('#remaining');const expires=document.querySelector('#expires');const expiresAt={expires_at};let urls=[];

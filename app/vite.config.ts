@@ -8,6 +8,11 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [vue()],
 
+  // 保留已有 dist 产物，避免受验证流程或其他构建产物影响的文件被 Vite 自动清空。
+  build: {
+    emptyOutDir: false,
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
